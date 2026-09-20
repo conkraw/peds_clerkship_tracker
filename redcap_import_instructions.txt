@@ -1,0 +1,37 @@
+MANUAL REDCAP IMPORT — NO API REQUIRED
+
+Use this file in the SAME REDCap project from which the reference was exported.
+It is a DATA import, not a Data Dictionary or a project-structure replacement.
+The app has not imported, emailed, or otherwise transmitted this file.
+
+1. In REDCap, open Applications > Data Import Tool.
+2. Choose real-time import and select the generated redcap_import.csv.
+3. Display the data comparison table: YES.
+4. Keep the existing record names/IDs; do NOT auto-number or rename records.
+5. Overwrite data with blank values: NO. This is essential: blank CSV cells are
+   omissions, NOT instructions to delete existing values.
+6. Use comma-separated CSV, records in rows, and YMD dates (YYYY-MM-DD).
+7. Review REDCap's validation and comparison table before clicking Import Data.
+   Stop if it shows unexpected new student records, changed existing source
+   values, wrong repeating instances, or field/code errors. Ask the director.
+8. After importing, check the affected records. Download a NEW full raw REDCap
+   export before preparing another batch. Do not reuse an old reference after
+   anyone has edited or imported data into the project.
+
+No concurrent edits/imports should occur between taking the reference export and
+finishing this import. Offline files cannot check for changes on the server.
+Upload the CSV directly; do not open and resave it in Excel (IDs, dates, and
+free-text responses must retain their original content).
+
+Existing manual grading exclusions and the automatic lowest-evaluation drop are
+applied by the app. Manually excluded submissions are not newly imported, as in
+the original scripts; submissions already in REDCap are NOT deleted. Excluded
+submissions still count as received for reminders. Existing REDCap calculations,
+NBME values, final grades, and unrelated manual fields are left to REDCap.
+Without a Data Dictionary, choice codes/field types cannot be fully checked by
+the app. Resolve all REDCap validation errors; never bypass the comparison step.
+Saved-exclusion configuration is not changed by this data CSV. Use the exclusion
+manager's JSON backup to retain session-only changes when API saving is unavailable.
+
+Reference documentation (University of Colorado REDCap Help Center):
+https://redcapucdenver.zendesk.com/hc/en-us/articles/31248111520276-Data-Import-Tool

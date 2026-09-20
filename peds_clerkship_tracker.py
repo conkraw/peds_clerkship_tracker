@@ -3,7 +3,7 @@
 Run: streamlit run peds_clerkship_tracker.py
 No code executes network calls or writes student data simply by being imported.
 Original rules: user's four Python scripts supplied September 19, 2026.
-See README.md for deliberate corrections, data coverage, and REDCap limitations.
+See README.md and PORTFOLIO_NOTES.md for routine use, data coverage, and REDCap limitations.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import urlencode, urlparse
 from zoneinfo import ZoneInfo
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 API_URL = "https://redcap.ctsi.psu.edu/api/"
 DOMAIN_KEYS = ("kp", "cr", "do", "cp", "ct")
 KINDS = ("cas", "hp", "handoff")
@@ -924,7 +924,10 @@ def import_candidates(run: Run, include_tracking: bool = True) -> list[dict]:
             summary_map[s["record_id"]]["exclude"] = s["exclude"]
     for s in run.roster:
         dates = [e["time_entered"] for e in run.entries if e["record_id"] == s["record_id"] and e["time_entered"]]
-        if dates:
+        complete = next((c["status"] == "Complete" for c in run.reports["checklist_review"] if c["record_id"] == s["record_id"]), False)
+        # The portfolio labels this as the date ALL clinical encounters were
+        # submitted. Never fill it from a partially completed checklist.
+        if dates and complete:
             summary_map[s["record_id"]]["submitted_ce"] = day(max(dates))
     if include_tracking:
         for row in tracking_rows(run):
@@ -978,7 +981,9 @@ def business_key(row: dict, people: People, metadata: Metadata | None, date_only
         begin, end = day(get(row, "eval_period_start_date")), day(get(row, "eval_period_end_date"))
         return (rid, inst, faculty, kind, begin, end) if faculty and kind and begin and end else None
     if inst == "checklist_entry":
-        when, item = stamp(get(row, "time_entered")), key(get(row, "item"))
+        item_value = get(row, "item")
+        item = key(metadata.decode("item", item_value) if metadata else item_value)
+        when = stamp(get(row, "time_entered"))
         # Original/copy is provenance, not a reason to duplicate the same source entry.
         return (rid, inst, when, item) if when and item else None
     return None
@@ -1526,7 +1531,7 @@ def exclusion_choices(raw_oasis: list[dict]) -> dict[str, dict]:
 
 
 def invalidate_rule_results(st: Any) -> None:
-    for k in ("result", "sync_plan", "upload_receipts"):
+    for k in ("result", "sync_plan", "upload_receipts", "manual_import"):
         st.session_state.pop(k, None)
 
 
@@ -1550,7 +1555,7 @@ def render_exclusion_manager(st: Any, api_url: str, token: str, oasis_file: Any)
             state["error"] = str(exc)
     dirty_ids = changed_rule_students(state["reference"], state["rules"])
     active_count = sum(r["active"] for r in state["rules"])
-    st.subheader("2 · Exclusions")
+    st.subheader("Evaluation exclusions")
     with st.expander(f"Manage exclusions · {active_count} active rules", expanded=bool(dirty_ids) or bool(state["error"])):
         st.write("Your three original student–preceptor exclusions are built in. Add a rule, deactivate it to remove the exclusion, or reactivate it later. No Python editing is needed.")
         st.caption("Clinical assessments only. Exclusions are applied before the automatic lowest-score drop. A received excluded evaluation still suppresses reminders; it is retained in the audit and omitted from new assessment imports.")
@@ -1691,226 +1696,854 @@ def render_exclusion_manager(st: Any, api_url: str, token: str, oasis_file: Any)
 # not a global cache shared between users.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Routine workflow. REDCap reads are optional for reminders and never import data.
+# Configuration and exclusion editing are kept in the director's workspace.
+# ---------------------------------------------------------------------------
+REMINDER_NAMES = (
+    "student_checklist_review.csv",
+    "feedback_reminders_power_automate.csv",
+    "preceptor_eval_reminders.csv",
+)
+LEGACY_CAS_COLUMNS = [
+    "faculty_email", "faculty_name", "student_name", "evaluation_type",
+    "expected_eval_count", "completed_eval_count", "pending_eval_count",
+    "duplicate_match_flag", "reminder_note", "blank_form_link", "partial_form_link",
+]
+LEGACY_HP_COLUMNS = [
+    "faculty_email", "faculty_name", "student_name", "reminder_note",
+    "blank_form_link", "partial_form_link",
+]
+PORTFOLIO_FIELDS = (
+    "distinct_count", "oasissolicit", "obhp_s", "obho_s",
+    "obhp_submissions", "obho_submissions", "knowledge_for_practice",
+    "clinical_reasoning", "documentation_oralpresentation",
+    "communication_ptsfamilies", "communication_care_team", "strengths",
+    "weaknesses", "oasis_cas", "obhp", "obho", "exclude",
+    "pre_adj_ass_grade", "clin_ass_grade", "submitted_ce", "final_grade",
+)
+
+
+def inferred_export_date(filename: str, as_of: str) -> str:
+    """A filename date is a convenient default, not proof of export completeness."""
+    for candidate in re.findall(r"(?<!\d)(20\d{6})(?!\d)", filename):
+        try:
+            value = datetime.strptime(candidate, "%Y%m%d").date().isoformat()
+            return min(value, as_of)
+        except ValueError:
+            continue
+    return as_of
+
+
+def exclusion_state_key(api_url: str, token: str) -> str:
+    return "exclusions_" + (digest([api_url, token])[:24] if token else "offline")
+
+
+def ensure_exclusion_state(session: Any, api_url: str, token: str) -> dict:
+    name = exclusion_state_key(api_url, token)
+    if name not in session:
+        defaults = load_private_rules()
+        session[name] = {"rules": defaults, "reference": defaults, "snapshot": None,
+                         "error": "", "notice": "", "attempted": False}
+    return session[name]
+
+
+def load_rules_from_reference(rows: list[dict], metadata: Metadata, client: Any) -> ExclusionSnapshot:
+    """Reuse the current export instead of asking the operator for a second file."""
+    definition = metadata.fields.get(EXCLUSION_FIELD)
+    if definition is None:
+        return ExclusionSnapshot()
+    if definition["type"] != "notes" or not definition["form"]:
+        raise ValueError("The saved-exclusions field must be a Notes Box on an internal, non-repeating instrument.")
+    metadata.encode(EXCLUSION_FIELD, "{}")
+    repeating = client.call("repeatingFormsEvents")
+    if not isinstance(repeating, list):
+        raise ValueError("Could not verify the saved-exclusions instrument.")
+    if any(get(row, "form_name") == definition["form"] for row in repeating):
+        raise ValueError("The saved-exclusions instrument must not repeat.")
+    return parse_exclusion_snapshot(rows, form=definition["form"])
+
+
+def automatic_reference(session: Any, api_url: str, token: str, *,
+                        refresh: bool = False, client: Any = None,
+                        now: datetime | None = None, max_age_seconds: int = 600) -> dict:
+    """Session-only cache. Calls READ endpoints, never imports or changes records.
+
+    A failed read is not promoted to a valid empty project. Reminder-only operation
+    may still use the four exports; scores/sync are withheld when saved rules cannot
+    be verified. Concurrent/unsaved exclusion edits are not overwritten.
+    """
+    if not token:
+        return {"rows": [], "metadata": None, "error": "", "rules_error": "",
+                "connected": False, "when": "", "connection": ""}
+    now = now or datetime.now(ZoneInfo("America/New_York"))
+    connection = digest([api_url, token])
+    cached = session.get("simple_reference")
+    if not refresh and cached and cached["connection"] == connection:
+        age = now.timestamp() - cached.get("checked_at", 0)
+        if 0 <= age < max_age_seconds:
+            return cached
+    state = ensure_exclusion_state(session, api_url, token)
+    value = {"rows": [], "metadata": None, "connected": False,
+             "when": now.isoformat(timespec="seconds"), "checked_at": now.timestamp(),
+             "connection": connection, "error": "", "rules_error": ""}
+    try:
+        client = client or RedcapClient(api_url, token)
+        rows, metadata = client.read()
+        if not rows or not metadata.fields:
+            raise ValueError("The connected project returned no records or field definitions.")
+        value.update(rows=rows, metadata=metadata, connected=True)
+        try:
+            stored = load_rules_from_reference(rows, metadata, client)
+            dirty = changed_rule_students(state["reference"], state["rules"])
+            if dirty:
+                # Leave the old baseline in place: ExclusionStore.save checks it
+                # against current data rather than silently hiding conflicts.
+                if state["error"]:
+                    raise ValueError("Resolve the saved-exclusion error before using the session's edits.")
+            else:
+                loaded = overlay_saved_rules(load_private_rules(), stored.stored)
+                state.update(snapshot=stored, rules=loaded, reference=loaded,
+                             error="", attempted=True)
+        except Exception as exc:
+            value["rules_error"] = str(exc).replace(token, "[REDACTED]")
+            state.update(error=value["rules_error"], attempted=True)
+    except Exception as exc:
+        value["error"] = str(exc).replace(token, "[REDACTED]")
+        value["rules_error"] = "Saved exclusions could not be checked because REDCap was unavailable."
+        state.update(error=value["rules_error"], attempted=True)
+    session["simple_reference"] = value
+    return value
+
+
+def daily_readiness(run: Run) -> dict[str, bool]:
+    valid = bool(run.roster) and not run.messages.blocked
+    checks = valid and all(run.coverage["checklist"].get(s["start_date"], False) for s in run.roster)
+    assessments = valid and all(
+        run.coverage["matches"].get(s["start_date"], False)
+        and run.coverage["oasis"].get(s["start_date"], False) for s in run.roster)
+    return {REMINDER_NAMES[0]: checks, REMINDER_NAMES[1]: assessments,
+            REMINDER_NAMES[2]: assessments}
+
+
+def reminder_only_files(run: Run) -> dict[str, bytes]:
+    """Only the three mailing files; never bundle grades or raw evaluation text."""
+    reports = output_files(run)
+    return {name: reports[name] for name in REMINDER_NAMES}
+
+
+def legacy_power_automate_files(run: Run) -> dict[str, bytes]:
+    """Optional original layouts for flows set up before the combined-preceptor app.
+
+    Never use these and the combined-preceptor file to send the same reminder run.
+    A student/preceptor can have one CAS row and one HP row in separate flows.
+    No handoff preceptor survey URL was provided in the user's original flow.
+    """
+    reports = output_files(run)
+    checks = [r for r in run.reports["checklist_review"] if r["status"] == "Needs review" and r["email"]]
+    check_rows = []
+    for r in checks:
+        r = dict(r)
+        # Older encounter flows do not have the newer incomplete/unknown columns.
+        # Put those issues into the original missing-items message as well.
+        issues = [r["missing_items"]] if r["missing_items"] else []
+        if r["participation_review_items"]:
+            issues.append("Participation level needs review: " + r["participation_review_items"])
+        if r["incomplete_items"]:
+            issues.append("Logged but not marked complete: " + r["incomplete_items"])
+        r["missing_items"] = "<br>".join(issues)
+        check_rows.append(r)
+    students = [r for r in run.reports["student_review"] if r["reminder_needed"] == "Yes" and r["email"]]
+    cas_rows, hp_rows = [], []
+    for row in run.reports["preceptor_reminders"]:
+        pending = set(row["evaluation_type"].split("; "))
+        for kind, target in (("cas", cas_rows), ("hp", hp_rows)):
+            if LABELS[kind] not in pending:
+                continue
+            link = row[kind + "_link"]
+            new = {**row, "evaluation_type": FORM_NAMES[kind], "expected_eval_count": 1,
+                   "completed_eval_count": 0, "pending_eval_count": 1, "duplicate_match_flag": "",
+                   "reminder_note": f"The student reported working with you. In the records through {row['data_through']}, we have not received the corresponding {LABELS[kind]} assessment.",
+                   "blank_form_link": link,
+                   "partial_form_link": link + "&complete=1&ph=3&ch=3&pp=3&cp=3" if run.settings.legacy_partial_links and link else ""}
+            target.append(new)
+    return {REMINDER_NAMES[0]: csv_bytes(check_rows, CHECKLIST_COLUMNS[:10], flow=True),
+            REMINDER_NAMES[1]: csv_bytes(students, STUDENT_COLUMNS[:8], flow=True),
+            REMINDER_NAMES[2]: csv_bytes(cas_rows, LEGACY_CAS_COLUMNS, flow=True),
+            "observed_hp_reminders.csv": csv_bytes(hp_rows, LEGACY_HP_COLUMNS, flow=True)}
+
+
+def portfolio_field_review(metadata: Metadata | None) -> list[dict]:
+    """Describe, do not invent, formulas hidden in the supplied portfolio PDF."""
+    review = []
+    for name in PORTFOLIO_FIELDS:
+        d = metadata.fields.get(name) if metadata else None
+        calculated = bool(d and (d["type"] == "calc" or "@CALC" in d["annotation"].upper()))
+        review.append({"field": name, "present_in_connected_project": bool(d),
+                       "form": d["form"] if d else "", "type": d["type"] if d else "",
+                       "calculated": calculated,
+                       "handling": "Source-derived update subject to preview" if name in {"exclude", "submitted_ce"}
+                       else "Leave existing REDCap calculation/manual value unchanged"})
+    return review
+
+
+def safe_daily_plan(run: Run, rows: list[dict], metadata: Metadata | None) -> SyncPlan:
+    """No extra tracking instrument is required; use installed fields only."""
+    if metadata is None:
+        plan = SyncPlan()
+        plan.errors.append("REDCap has not been connected. Reminder downloads do not require this step.")
+        return plan
+    if not all(daily_readiness(run).values()):
+        plan = SyncPlan()
+        plan.errors.append("The source files do not cover the same selected rotation. Reminder processing and REDCap updating are separate; correct the sources before updating REDCap.")
+        return plan
+    installed_tracking = bool(set(TRACKING_FIELDS) & set(metadata.fields))
+    return plan_sync(run, rows, metadata, replace_conflicts=False, allow_clears=False,
+                     include_tracking=installed_tracking)
+
+
+def prepare_routine_run(source_bytes: list[bytes], snapshot: list[dict], settings: Settings) -> Run:
+    if len(source_bytes) != 4 or not all(source_bytes):
+        raise ValueError("Upload the rotation schedule, checklist, preceptor matches, and OASIS evaluation export.")
+    messages = Messages()
+    labels = ("Rotation schedule", "Checklist", "Preceptor matches", "OASIS ME")
+    raw = [read_csv_bytes(data, name, messages) for data, name in zip(source_bytes, labels)]
+    return process(*raw, snapshot=snapshot, settings=settings, log=messages)
+
+
+def app_secret(st: Any, name: str, fallback: str = "") -> str:
+    try:
+        return text(st.secrets.get(name, os.getenv(name, fallback)))
+    except (FileNotFoundError, KeyError):
+        return os.getenv(name, fallback)
+
+
+def routine_settings(options: dict, filenames: list[str], rules: list[dict]) -> Settings:
+    today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    as_of = options.get("as_of") or today
+    return Settings(as_of=as_of,
+                    data_through=options.get("data_through") or inferred_export_date(filenames[3] if len(filenames) > 3 else "", as_of),
+                    targets={k: int(options.get(k + "_target", v)) for k, v in {"cas": 8, "hp": 2, "handoff": 1}.items()},
+                    fallback_rotation_days=int(options.get("rotation_days", 26)),
+                    grace_days=int(options.get("grace_days", 0)), cohort=options.get("cohort", "all"),
+                    confirm_coverage=bool(options.get("confirm_coverage", False)),
+                    exclusions=normalize_rules(rules),
+                    survey_urls={k: options.get(k + "_url", SURVEYS[k]) for k in KINDS},
+                    legacy_partial_links=bool(options.get("legacy_partial_links", False)))
+
+
+def routine_fingerprint(source_bytes: list[bytes], filenames: list[str], settings: Settings,
+                        backup_bytes: bytes, connection: str) -> str:
+    return digest([[hashlib.sha256(b).hexdigest() for b in source_bytes], filenames,
+                   asdict(settings), hashlib.sha256(backup_bytes).hexdigest(), connection])
+
+
+def render_director_tools(st: Any, api_url: str, token: str, oasis_file: Any) -> None:
+    st.subheader("Director tools")
+    st.caption("These controls are not part of the routine reminder workflow. Do not enter credentials here.")
+    choices = st.radio("Director workspace", ["Exclusions", "Processing options", "Connection status"], horizontal=True, key="director_workspace")
+    if choices == "Exclusions":
+        render_exclusion_manager(st, api_url, token, oasis_file)
+        return
+    if choices == "Processing options":
+        opts = st.session_state.get("simple_options", {})
+        today = datetime.now(ZoneInfo("America/New_York")).date()
+        with st.form("director_processing_options"):
+            use_today = st.checkbox("Use today's date automatically", value=not bool(opts.get("as_of")))
+            as_of = st.date_input("Review date", value=dt(opts.get("as_of")).date() if opts.get("as_of") else today)
+            auto_date = st.checkbox("Read the export date from the OASIS filename when available", value=not bool(opts.get("data_through")))
+            data_through = st.date_input("Export coverage date override", value=dt(opts.get("data_through")).date() if opts.get("data_through") else as_of)
+            cohort = st.selectbox("Students to include", ["All students in the uploaded schedule", "Only students currently on rotation"], index=1 if opts.get("cohort") == "active" else 0)
+            counts = {}
+            for k, default in {"cas": 8, "hp": 2, "handoff": 1}.items():
+                counts[k + "_target"] = int(st.number_input(LABELS[k] + " requirement", min_value=1, max_value=50, value=int(opts.get(k + "_target", default))))
+            days = int(st.number_input("Rotation length when end date is absent", 1, 366, int(opts.get("rotation_days", 26))))
+            grace = int(st.number_input("Days to wait after a preceptor evaluation period ends", 0, 60, int(opts.get("grace_days", 0))))
+            coverage_ok = st.checkbox("I verified that a rotation with no exported rows genuinely has zero entries", value=bool(opts.get("confirm_coverage", False)))
+            st.caption("Normally leave this off. Do not use it to override exports from different rotations.")
+            urls = {k + "_url": st.text_input(LABELS[k] + " form URL", value=opts.get(k + "_url", SURVEYS[k])) for k in KINDS}
+            legacy = st.checkbox("Include old partial-form links that prefill ratings", value=bool(opts.get("legacy_partial_links", False)))
+            if st.form_submit_button("Save processing options"):
+                if not auto_date and data_through > as_of:
+                    st.error("The export date cannot be later than the review date.")
+                else:
+                    st.session_state.simple_options = {**counts, **urls, "as_of": "" if use_today else as_of.isoformat(), "data_through": "" if auto_date else data_through.isoformat(), "cohort": "active" if cohort.startswith("Only") else "all", "rotation_days": days, "grace_days": grace, "confirm_coverage": coverage_ok, "legacy_partial_links": legacy}
+                    invalidate_rule_results(st)
+                    st.rerun()
+        if st.button("Restore ordinary reminder settings"):
+            st.session_state.simple_options = {}
+            invalidate_rule_results(st)
+            st.rerun()
+    else:
+        st.write("REDCap credentials are configured once in Streamlit Settings → Secrets. Routine users only upload their four files.")
+        st.write("Saved connection configured." if token else "No saved REDCap token. Reminders still work when the four files identify each student.")
+        ref = st.session_state.get("simple_reference", {})
+        if ref.get("when"):
+            st.caption("Last connection check: " + ref["when"])
+        for name in ("error", "rules_error"):
+            if ref.get(name):
+                st.warning(ref[name])
+        if st.button("Check connection now", disabled=not bool(token)):
+            with st.spinner("Reading the existing project; no changes are being made..."):
+                ref = automatic_reference(st.session_state, api_url, token, refresh=True)
+            if ref["connected"] and not ref["rules_error"]:
+                st.success("Connection works. The reference export will load automatically when reminder files are created.")
+            else:
+                st.warning(ref["error"] or ref["rules_error"])
+        backup = st.file_uploader("Optional backup REDCap export", type="csv", key="director_snapshot")
+        if backup:
+            st.session_state.backup_reference_bytes = backup.getvalue()
+            st.caption("Backup loaded for name matching when the connection is unavailable; not used instead of a fresh read before an upload.")
+        if st.button("Remove backup reference"):
+            st.session_state.backup_reference_bytes = b""
+            st.rerun()
+        st.caption("The review-form PDF identifies the fields displayed to students. It is not a current student-data export and does not expose the underlying calculation formulas.")
+        if ref.get("metadata"):
+            st.dataframe(portfolio_field_review(ref["metadata"]), hide_index=True, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Manual REDCap imports: no API, no network, and no external write operations.
+# Reuse the existing reconciliation logic; never invent repeat-instance numbers
+# without a complete current reference. A download is NOT an import receipt.
+# ---------------------------------------------------------------------------
+MANUAL_REFERENCE_COLUMNS = (
+    *REPEAT, "start_date", "evaluator", "evaluator_email", "evaluation",
+    "submit_date", "epa_evaluator", "epa_evaluator_email", "epa_evaluation",
+    "epa_submit_date", "item", "time_entered", "faculty_name", "faculty_email",
+    "manual_evaluations", "eval_period_start_date", "eval_period_end_date",
+)
+MANUAL_IMPORT_HELP = """MANUAL REDCAP IMPORT — NO API REQUIRED
+
+Use this file in the SAME REDCap project from which the reference was exported.
+It is a DATA import, not a Data Dictionary or a project-structure replacement.
+The app has not imported, emailed, or otherwise transmitted this file.
+
+1. In REDCap, open Applications > Data Import Tool.
+2. Choose real-time import and select the generated redcap_import.csv.
+3. Display the data comparison table: YES.
+4. Keep the existing record names/IDs; do NOT auto-number or rename records.
+5. Overwrite data with blank values: NO. This is essential: blank CSV cells are
+   omissions, NOT instructions to delete existing values.
+6. Use comma-separated CSV, records in rows, and YMD dates (YYYY-MM-DD).
+7. Review REDCap's validation and comparison table before clicking Import Data.
+   Stop if it shows unexpected new student records, changed existing source
+   values, wrong repeating instances, or field/code errors. Ask the director.
+8. After importing, check the affected records. Download a NEW full raw REDCap
+   export before preparing another batch. Do not reuse an old reference after
+   anyone has edited or imported data into the project.
+
+No concurrent edits/imports should occur between taking the reference export and
+finishing this import. Offline files cannot check for changes on the server.
+Upload the CSV directly; do not open and resave it in Excel (IDs, dates, and
+free-text responses must retain their original content).
+
+Existing manual grading exclusions and the automatic lowest-evaluation drop are
+applied by the app. Manually excluded submissions are not newly imported, as in
+the original scripts; submissions already in REDCap are NOT deleted. Excluded
+submissions still count as received for reminders. Existing REDCap calculations,
+NBME values, final grades, and unrelated manual fields are left to REDCap.
+Without a Data Dictionary, choice codes/field types cannot be fully checked by
+the app. Resolve all REDCap validation errors; never bypass the comparison step.
+Saved-exclusion configuration is not changed by this data CSV. Use the exclusion
+manager's JSON backup to retain session-only changes when API saving is unavailable.
+
+Reference documentation (University of Colorado REDCap Help Center):
+https://redcapucdenver.zendesk.com/hc/en-us/articles/31248111520276-Data-Import-Tool
+"""
+
+
+@dataclass
+class ManualImport:
+    plan: SyncPlan = field(default_factory=SyncPlan)
+    run: Run | None = None
+    metadata_checked: bool = False
+    reference_fingerprint: str = ""
+
+
+def validate_manual_reference(rows: list[dict]) -> list[str]:
+    """Validate recognizable structure, not unprovable completeness/freshness."""
+    if not rows:
+        return ["Upload a current full REDCap data export before preparing the import file."]
+    columns = {k for row in rows for k in row}
+    missing = set(MANUAL_REFERENCE_COLUMNS) - columns
+    if missing:
+        return ["This looks like a partial report, not a full-project export. Export all "
+                "records/fields with raw variable names and all repeating instruments. "
+                "Missing columns: " + ", ".join(sorted(missing))]
+    if any(get(row, "redcap_event_name") for row in rows):
+        return ["This app uses your non-longitudinal project. Event-based exports need an explicit mapping."]
+    parent_ids = []
+    for row in rows:
+        if not get(row, "record_id"):
+            return ["The reference contains a blank record ID; no import file was prepared."]
+        if not get(row, "redcap_repeat_instrument"):
+            if get(row, "redcap_repeat_instance"):
+                return ["The reference has a parent row with a repeating instance; check the export."]
+            parent_ids.append(norm(get(row, "record_id")))
+    if not parent_ids:
+        return ["Include the main student records as well as repeating records in the REDCap export."]
+    if len(parent_ids) != len(set(parent_ids)):
+        return ["The reference has duplicate main student records. Correct the export before importing."]
+    return []
+
+
+def manual_exclusion_rules(rows: list[dict], current: list[dict],
+                           baseline: list[dict] | None = None) -> tuple[list[dict], list[str]]:
+    """Honor saved rules; preserve nonconflicting unsaved director edits.
+
+    Exported saved rules replace their student's defaults exactly as in the live
+    workflow. A conflict is not silently decided in favor of stale session data.
+    This function does not save rules or mutate any session/reference object.
+    """
+    current = normalize_rules(current)
+    if not any(EXCLUSION_FIELD in row for row in rows):
+        return current, ["The export has no saved-exclusion configuration field. The import uses "
+                         "the exclusions currently loaded in the app. Retain a JSON backup of any new rules."]
+    stored = parse_exclusion_snapshot(rows)
+    base = normalize_rules(baseline if baseline is not None else load_private_rules())
+    latest = overlay_saved_rules(load_private_rules(), stored.stored)
+    dirty = changed_rule_students(base, current)
+    old_by, new_by, current_by = map(rules_by_student, (base, latest, current))
+    # Limit conflict checking to students actually represented in this export.
+    dirty &= set(stored.parents)
+    for rid in sorted(dirty):
+        if (old_by.get(rid, []) != new_by.get(rid, [])
+                and current_by.get(rid, []) != new_by.get(rid, [])):
+            raise ValueError("Saved exclusions and unsaved edits both changed for " + rid
+                             + ". Reconcile these in Director tools before preparing the import.")
+    parent_ids = set(stored.parents)
+    combined = [r for r in latest if r["record_id"] not in dirty and r["record_id"] in parent_ids]
+    combined += [r for r in current if r["record_id"] in dirty or r["record_id"] not in parent_ids]
+    return normalize_rules(combined), []
+
+
+def prepare_manual_import(source_bytes: list[bytes], reference_rows: list[dict],
+                          settings: Settings, metadata: Metadata | None = None,
+                          *, baseline_rules: list[dict] | None = None) -> ManualImport:
+    """Prepare only a local CSV plan. No API token/client/network is used here."""
+    result = ManualImport(metadata_checked=metadata is not None)
+    result.plan.errors = validate_manual_reference(reference_rows)
+    if result.plan.errors:
+        return result
+    try:
+        rules, rule_warnings = manual_exclusion_rules(reference_rows, settings.exclusions, baseline_rules)
+        opts = {**asdict(settings), "exclusions": rules}
+        run = prepare_routine_run(source_bytes, reference_rows, Settings(**opts))
+        result.run = run
+        if not all(daily_readiness(run).values()):
+            result.plan.errors.append("The source files do not cover the same selected rotation, "
+                                      "or student matching needs review. Correct those checks first.")
+            return result
+        ids = {r["record_id"] for r in run.roster}
+        # Without a dictionary a coded assessment identity cannot be matched.
+        # Do not append a supposed 'new' evaluation over an unrecognized old one.
+        if metadata is None:
+            for row in reference_rows:
+                if norm(get(row, "record_id")) not in ids:
+                    continue
+                inst = get(row, "redcap_repeat_instrument")
+                field_name = {"oasis_eval": "evaluation", "epa": "epa_evaluation",
+                              "preceptor_matching": "manual_evaluations"}.get(inst)
+                if field_name and get(row, field_name) and not kind_of(get(row, field_name)):
+                    raise ValueError("The reference uses coded or unrecognized assessment names. "
+                                     "Add the current REDCap Data Dictionary using Additional field checks.")
+                if inst == "checklist_entry" and number(get(row, "item")) is not None:
+                    raise ValueError("The reference uses coded checklist items. Add the REDCap "
+                                     "Data Dictionary using Additional field checks.")
+        # No new tracking instrument is needed. Preserve the routine update's
+        # optional existing tracking fields only when their metadata is known.
+        include_tracking = bool(metadata and set(TRACKING_FIELDS) & set(metadata.fields))
+        result.plan = plan_sync(run, reference_rows, metadata, replace_conflicts=False,
+                                allow_clears=False, include_tracking=include_tracking)
+        result.reference_fingerprint = result.plan.snapshot_fingerprint
+        result.plan.warnings.extend(rule_warnings)
+        if metadata is None:
+            result.plan.warnings = [w for w in result.plan.warnings if not w.startswith("Snapshot-only plan:")]
+            result.plan.warnings.append("Field types and choice codes are not fully validated without a Data Dictionary. "
+                                        "REDCap's Data Import Tool must validate this CSV before you approve it.")
+        result.plan.warnings = list(dict.fromkeys(result.plan.warnings))
+    except (ValueError, TypeError, KeyError) as exc:
+        result.plan.errors.append(str(exc))
+    return result
+
+
+def manual_import_csv(plan: SyncPlan) -> bytes:
+    """Sparse update CSV with fixed existing IDs and explicit integer instances.
+
+    Blank cells mean 'leave unchanged'; import with blank-overwrite set to NO.
+    Preserve clinical free text verbatim internally: never use flow=True here.
+    """
+    if plan.errors:
+        raise ValueError("Resolve import checks before downloading a REDCap data file.")
+    if plan.clear_records:
+        raise ValueError("Blank-clearing instructions cannot be included in this import file.")
+    if not plan.records:
+        raise ValueError("There are no new or changed values to import.")
+    seen = set()
+    for row in plan.records:
+        rid, inst, repeat = (text(row.get(k)) for k in REPEAT)
+        if not rid or (inst and (not normalized_repeat(repeat) or normalized_repeat(repeat) != repeat)) or (not inst and repeat):
+            raise ValueError("Invalid record or repeating-instance identity in the proposed import.")
+        identity = (rid, inst, repeat)
+        if identity in seen:
+            raise ValueError("Duplicate target identities in the proposed import.")
+        seen.add(identity)
+        if any(k not in REPEAT and not text(v) for k, v in row.items()):
+            raise ValueError("The proposed import contains an explicit blank update; review it with the director.")
+    columns = list(REPEAT) + sorted({k for row in plan.records for k in row} - set(REPEAT))
+    return csv_bytes(plan.records, columns=columns, flow=False)
+
+
+def render_manual_redcap(st: Any, result: dict, source_bytes: list[bytes],
+                         settings: Settings, fingerprint: str,
+                         api_url: str = "", token: str = "") -> None:
+    """A self-contained no-API fallback, including after an API-read failure."""
+    with st.expander("Download REDCap import file — no API required", expanded=False):
+        st.write("Create one CSV to upload yourself in REDCap's Data Import Tool. "
+                 "This does not change your Power Automate files or send data to REDCap.")
+        upload = st.file_uploader("Current full REDCap export (CSV)", type="csv", key="manual_reference_upload",
+                                  help="Use a fresh export of all data, with raw variable names/values and all repeating instances. The review-form PDF and rotation-only report are not data exports.")
+        backup = st.session_state.get("backup_reference_bytes", b"")
+        ref = result.get("reference", {})
+        reference_bytes = upload.getvalue() if upload is not None else backup
+        reference_rows = []
+        reference_error = ""
+        reference_tag = hashlib.sha256(reference_bytes).hexdigest() if reference_bytes else digest([ref.get("connection"), ref.get("when"), ref.get("checked_at")])
+        try:
+            if reference_bytes:
+                cache = st.session_state.get("manual_reference_cache", {})
+                if cache.get("tag") == reference_tag:
+                    reference_rows = cache["rows"]
+                else:
+                    reference_rows = read_csv_bytes(reference_bytes, "REDCap reference", Messages())
+                    st.session_state.manual_reference_cache = {"tag": reference_tag, "rows": reference_rows}
+                st.caption("Using the uploaded reference export. No API is used to prepare this file.")
+            elif ref.get("connected") and ref.get("rows"):
+                reference_rows = ref["rows"]
+                st.caption("Using the reference already read from REDCap when you created the reminders. "
+                           "No further API call or API upload is needed for this download.")
+            else:
+                st.info("Upload a fresh full REDCap export here. It is needed only for the REDCap import file, "
+                        "so existing evaluations and repeating-instance numbers can be matched instead of duplicated.")
+        except ValueError as exc:
+            reference_error = str(exc)
+            st.warning(reference_error)
+        # Do not silently apply cached metadata from another reference/project.
+        metadata = ref.get("metadata") if not reference_bytes and ref.get("connected") else None
+        dictionary_bytes = b""
+        if st.checkbox("Additional field checks — optional Data Dictionary", value=False, key="manual_dictionary_checks"):
+            dd = st.file_uploader("REDCap Data Dictionary (CSV)", type="csv", key="manual_dictionary_upload")
+            if dd is not None:
+                dictionary_bytes = dd.getvalue()
+                try:
+                    metadata = Metadata(read_csv_bytes(dictionary_bytes, "Data Dictionary", Messages()))
+                    if not metadata.fields:
+                        raise ValueError("This file does not contain REDCap field definitions.")
+                except ValueError as exc:
+                    reference_error = str(exc)
+                    st.warning(reference_error)
+        confirmed = st.checkbox("This is a current, complete export from the destination project; "
+                                "no records have changed since it was exported.", key="manual_reference_confirmed")
+        state = ensure_exclusion_state(st.session_state, api_url, token)
+        local_key = digest([fingerprint, reference_tag, metadata.fields if metadata else {}, hashlib.sha256(dictionary_bytes).hexdigest(),
+                            state["reference"], settings.exclusions])
+        if st.button("Prepare REDCap import file", key="manual_prepare", disabled=not reference_rows or not confirmed or bool(reference_error)):
+            manual = prepare_manual_import(source_bytes, reference_rows, settings, metadata,
+                                           baseline_rules=state["reference"])
+            st.session_state.manual_import = {"key": local_key, "value": manual}
+        saved = st.session_state.get("manual_import")
+        if saved and saved.get("key") != local_key:
+            st.info("The reference, files, or exclusions changed. Prepare a new REDCap import file.")
+            saved = None
+        if saved:
+            manual = saved["value"]
+            plan = manual.plan
+            if plan.errors:
+                st.warning("No import CSV is available until these checks are resolved. Reminder downloads are unaffected.")
+                for error in plan.errors:
+                    st.write(error)
+            else:
+                summary = Counter(r.get("redcap_repeat_instrument") or "student summary" for r in plan.records)
+                st.write(f"{len(plan.records)} rows contain new or changed values. Existing matching entries retain their instance numbers.")
+                if summary:
+                    st.dataframe([{"Record type": k, "Rows in file": v} for k, v in summary.items()], hide_index=True, use_container_width=True)
+                conflicts = sum(r["action"] == "Conflict — preserved" for r in plan.changes)
+                if conflicts:
+                    st.warning(f"{conflicts} existing source values differ. They are omitted from the update and left unchanged; the director should review them.")
+                for message in plan.warnings:
+                    st.caption(message)
+                if not manual.metadata_checked:
+                    st.info("This CSV still needs REDCap's field/code validation. Review its comparison table before approving the import.")
+                st.warning("In REDCap: keep the existing record IDs, set Overwrite data with blank values to NO, "
+                           "and review the comparison table. Get a new reference export after any intervening import or edit.")
+                if plan.records:
+                    try:
+                        payload = manual_import_csv(plan)
+                        st.download_button("Download REDCap import CSV", payload, "redcap_import.csv", "text/csv",
+                                           key="manual_download", disabled=not confirmed or bool(reference_error))
+                    except ValueError as exc:
+                        st.warning(str(exc))
+                else:
+                    st.success("No new values to import from these files. No empty import file is needed.")
+                st.download_button("Download import instructions", MANUAL_IMPORT_HELP.encode("utf-8"),
+                                   "redcap_import_instructions.txt", "text/plain", key="manual_instructions")
+                if st.checkbox("Show import details for the director", key="manual_show_details"):
+                    st.dataframe(plan.changes, hide_index=True, use_container_width=True)
+                    st.download_button("Download import change report", csv_bytes(plan.changes),
+                                       "redcap_manual_change_report.csv", "text/csv", key="manual_changes")
+        st.caption("Downloading is not importing. No API connection, API token, or new tracking instrument is required for this manual path. "
+                   "Existing REDCap final-grade calculations and unrelated manual values are not replaced. "
+                   "New session-only exclusion rules still need a JSON backup when API saving is unavailable.")
+
+
+def render_routine_redcap(st: Any, result: dict, api_url: str, token: str,
+                          source_bytes: list[bytes], settings: Settings,
+                          fingerprint: str) -> None:
+    if not token:
+        return
+    with st.expander("Update REDCap — optional", expanded=False):
+        st.write("Reminder files are ready independently of this step. Use this section only to update the existing student records.")
+        st.caption("The app reads the current project automatically. It does not ask you to export a database or upload a Data Dictionary.")
+        if st.button("Review REDCap update", disabled=not all(daily_readiness(result["run"]).values()), key="simple_prepare_redcap"):
+            st.session_state.pop("sync_plan", None)
+            try:
+                with st.spinner("Reading REDCap and checking the proposed update..."):
+                    ref = automatic_reference(st.session_state, api_url, token, refresh=True)
+                    if not ref["connected"]:
+                        raise ValueError("REDCap could not be reached. Your reminder files are unaffected. Ask the director to check the saved connection.")
+                    if ref["rules_error"]:
+                        raise ValueError("Saved exclusions could not be verified. Your reminder files are unaffected; the director needs to review the exclusion settings.")
+                    state = ensure_exclusion_state(st.session_state, api_url, token)
+                    if digest(normalize_rules(state["rules"])) != digest(settings.exclusions):
+                        raise ValueError("Saved exclusions changed. Click Create reminder files again before preparing the REDCap update.")
+                    fresh_run = prepare_routine_run(source_bytes, ref["rows"], settings)
+                    plan = safe_daily_plan(fresh_run, ref["rows"], ref["metadata"])
+                    st.session_state.sync_plan = {"plan": plan, "run": fresh_run, "key": fingerprint,
+                                                  "connection": digest([api_url, token])}
+            except Exception as exc:
+                st.warning(str(exc).replace(token, "[REDACTED]"))
+        saved = st.session_state.get("sync_plan")
+        if saved and (saved.get("key") != fingerprint or saved.get("connection") != digest([api_url, token])):
+            st.info("The inputs changed. Review the REDCap update again.")
+            saved = None
+        if saved:
+            plan = saved["plan"]
+            if plan.errors:
+                st.warning("This REDCap update needs the director's review. Reminder downloads are not affected.")
+                if st.checkbox("Show details for the director", key="simple_show_sync_errors"):
+                    for error in plan.errors:
+                        st.write(error)
+            else:
+                summary = Counter(r.get("redcap_repeat_instrument") or "student summary" for r in plan.records)
+                st.write(f"{len(plan.records)} records to add or update. Existing matching records will not be duplicated.")
+                if summary:
+                    st.dataframe([{"Record type": k, "To update": v} for k, v in summary.items()], hide_index=True, use_container_width=True)
+                conflicts = sum(c["action"] == "Conflict — preserved" for c in plan.changes)
+                if conflicts:
+                    st.warning(f"{conflicts} existing values differ from the source. They will be left unchanged for the director to review.")
+                if any("absent from" in w for w in plan.warnings):
+                    st.warning("REDCap contains evaluations absent from this OASIS file. Score/exclusion summaries are withheld; use a complete OASIS export for grading.")
+                if any("clearing" in w for w in plan.warnings):
+                    st.warning("An old summary value would need to be cleared. This update preserves it; the director should review the details.")
+                if st.checkbox("Show proposed field changes", key="simple_show_sync_changes"):
+                    st.dataframe(plan.changes, hide_index=True, use_container_width=True)
+                    for message in plan.warnings:
+                        st.caption(message)
+                    st.download_button("Download change report", csv_bytes(plan.changes), "redcap_change_audit.csv", "text/csv", key="simple_change_report")
+                approved = st.checkbox("I approve this update to the selected students' REDCap records", key="approve_simple_" + digest([fingerprint, plan.changes])[:12])
+                if st.button("Confirm update to REDCap", disabled=not approved or not bool(plan.records), key="simple_confirm_redcap"):
+                    try:
+                        with st.spinner("Updating REDCap and verifying the saved values..."):
+                            receipts = RedcapClient(api_url, token).upload(plan, saved["run"])
+                        st.session_state.upload_receipts = receipts
+                        st.session_state.pop("simple_reference", None)
+                        st.success("REDCap update saved and verified.")
+                    except Exception as exc:
+                        st.warning(str(exc).replace(token, "[REDACTED]"))
+                        st.warning("Some records may already have been saved. Review a fresh REDCap update before trying again.")
+                        st.session_state.pop("simple_reference", None)
+                    finally:
+                        st.session_state.pop("sync_plan", None)
+        if st.session_state.get("upload_receipts"):
+            st.download_button("Download update receipt", csv_bytes(st.session_state.upload_receipts), "redcap_import_receipt.csv", "text/csv", key="simple_receipt")
+        st.caption("The existing evaluation, H&P/handoff, checklist, and matching instruments are used. REDCap calculations, final grades, NBME, and unrelated manually entered fields are not replaced. No new tracking instrument is required.")
+
+
 def main() -> None:
     import hmac
     import streamlit as st
 
-    st.set_page_config(page_title="Pediatric Clerkship Tracker", page_icon="📋", layout="wide")
-
-    def secret(name: str, fallback: str = "") -> str:
-        try:
-            return text(st.secrets.get(name, os.getenv(name, fallback)))
-        except (FileNotFoundError, KeyError):
-            return os.getenv(name, fallback)
-
-    app_password = secret("APP_PASSWORD")
-    trusted_host = norm(secret("TRUSTED_HOST_AUTH", "false")) == "true"
-    if not app_password and not trusted_host:
-        st.title("Pediatric Clerkship Tracker")
-        st.info("Online setup: add APP_PASSWORD to this app's Secrets before using it. Keep the code repository private and restrict the deployed app's viewers. See ONLINE_SETUP.md.")
-        st.caption("An institution-administered, authenticated host may instead set TRUSTED_HOST_AUTH=true. That setting does not itself provide authentication.")
+    st.set_page_config(page_title="Pediatric Clerkship Reminders", page_icon="📋", layout="wide")
+    password = app_secret(st, "APP_PASSWORD")
+    trusted = norm(app_secret(st, "TRUSTED_HOST_AUTH", "false")) == "true"
+    if not password and not trusted:
+        st.title("Pediatric Clerkship Reminders")
+        st.info("The director needs to finish the one-time app sign-in setup in Streamlit Secrets.")
         st.stop()
-    if app_password and (len(app_password) < 16 or app_password.startswith("CHANGE_ME")):
-        st.error("Set APP_PASSWORD to a unique password of at least 16 characters in the app's Secrets.")
+    if password and (len(password) < 16 or password.startswith("CHANGE_ME")):
+        st.error("Set a unique APP_PASSWORD of at least 16 characters in Streamlit Secrets.")
         st.stop()
-    auth_key = digest(app_password) if app_password else "trusted-host"
-    if app_password and st.session_state.get("authenticated") != auth_key:
-        st.title("Pediatric Clerkship Tracker")
+    auth_key = digest(password) if password else "trusted-host"
+    if password and st.session_state.get("authenticated") != auth_key:
+        st.title("Pediatric Clerkship Reminders")
         with st.form("sign_in"):
-            password = st.text_input("App password", type="password")
+            entered = st.text_input("App password", type="password")
             login = st.form_submit_button("Sign in")
         if login:
-            if hmac.compare_digest(password.encode("utf-8"), app_password.encode("utf-8")):
+            if hmac.compare_digest(entered.encode("utf-8"), password.encode("utf-8")):
                 st.session_state.authenticated = auth_key
                 st.rerun()
             else:
                 st.error("Incorrect password.")
         st.stop()
+
+    api_url = app_secret(st, "REDCAP_API_URL", API_URL)
+    token = app_secret(st, "REDCAP_API_TOKEN")
+    connection = digest([api_url, token]) if token else ""
     with st.sidebar:
-        if app_password and st.button("Sign out / clear session"):
+        st.caption("Clerkship reminder tools")
+        if st.button("Start over / clear uploaded files", key="simple_reset"):
+            keep = {k: v for k, v in st.session_state.items() if k in {"authenticated", "simple_options"} or k.startswith("exclusions_")}
+            st.session_state.clear()
+            st.session_state.update(keep)
+            st.rerun()
+        if password and st.button("Sign out", key="simple_signout"):
             st.session_state.clear()
             st.rerun()
+        director = st.checkbox("Show director tools", value=False, key="show_director_tools")
+        st.caption("v" + VERSION)
 
-    st.title("Pediatric Clerkship Tracker")
-    st.caption("Upload → Review → Download reminders → Update REDCap")
-    st.write("One place for encounter logs, evaluation requests, clinical scores, and preceptor follow-up.")
-    st.caption("Online-ready · Use institution-approved hosting with restricted viewers. This app generates files; it does not send email.")
-    with st.sidebar:
-        st.header("Processing settings")
-        as_of = st.date_input("As-of date", value=datetime.now(ZoneInfo("America/New_York")).date())
-        cohort_label = st.selectbox("Students to process", ["All rotations in uploaded schedule", "Only students active on as-of date"])
-        with st.expander("Requirements and exceptions"):
-            cas_target = int(st.number_input("Clinical assessments", 1, 50, 8))
-            hp_target = int(st.number_input("Observed H&Ps", 1, 20, 2))
-            handoff_target = int(st.number_input("Handoffs", 1, 20, 1))
-            fallback_days = int(st.number_input("Rotation days when end date is unavailable (inclusive)", 1, 366, 26))
-            grace = int(st.number_input("Preceptor grace days after evaluation-period end", 0, 60, 0))
-            st.caption("Use the Exclusions section below to manage student–preceptor rules. The original three are built in.")
-            st.caption("Automatic rule: drop one lowest scorable clinical evaluation when at least four are eligible, after manual exclusions.")
-        with st.expander("Survey links"):
-            cas_url = st.text_input("Clinical assessment survey", SURVEYS["cas"])
-            hp_url = st.text_input("Observed H&P survey", SURVEYS["hp"])
-            handoff_url = st.text_input("Handoff survey (optional)", SURVEYS["handoff"])
-            legacy_links = st.checkbox("Include old partial-form links that prefill ratings", value=False)
-            if legacy_links:
-                st.warning("Legacy links prefill complete=1 and ratings of 3. Use only after reviewing that behavior; ordinary blank links are safer.")
-
-    st.subheader("1 · Upload the four source files")
+    st.title("Pediatric Clerkship Reminders")
+    st.write("Upload the four files, create the reminders, then download the files for Power Automate.")
+    st.caption("Use exports for the same rotation. This app creates files; it does not send email.")
+    st.subheader("1 · Upload files")
     left, right = st.columns(2)
     with left:
-        schedule_file = st.file_uploader("Rotation schedule", type="csv", key="schedule_upload", help="legal_name and start_date; record_id and email are helpful but optional when resolvable.")
+        schedule_file = st.file_uploader("Rotation schedule", type="csv", key="schedule_upload")
         checklist_file = st.file_uploader("Updated checklist", type="csv", key="checklist_upload")
     with right:
         match_file = st.file_uploader("Preceptor match file", type="csv", key="match_upload")
-        oasis_file = st.file_uploader("OASIS ME evaluations", type="csv", key="oasis_upload")
-    with st.expander("REDCap reference and connection", expanded=True):
-        st.caption("Use the 0959 full-project export to resolve names and plan imports, or read the current project through its API. No write occurs here.")
-        snapshot_file = st.file_uploader("Full REDCap export — optional for reminders, required for offline sync preview", type="csv", key="snapshot_upload")
-        metadata_file = st.file_uploader("REDCap Data Dictionary — optional; live connection reads metadata automatically", type="csv", key="metadata_upload")
-        api_url = st.text_input("REDCap API URL", value=secret("REDCAP_API_URL", API_URL), disabled=bool(secret("REDCAP_API_TOKEN")), help="When a token is stored in Secrets, change its endpoint in Secrets too.")
-        entered_token = st.text_input("API token — leave empty to use Streamlit secrets", type="password", key="api_token_input")
-        token = entered_token or secret("REDCAP_API_TOKEN")
-        connection_key = digest([api_url, token]) if token else ""
-        if st.button("Read current REDCap records and field definitions", disabled=not bool(token)):
-            try:
-                with st.spinner("Reading REDCap; no records are being changed..."):
-                    live_rows, live_metadata = RedcapClient(api_url, token).read()
-                st.session_state.live = {"rows": live_rows, "metadata": live_metadata, "connection": connection_key, "when": datetime.now().isoformat(timespec="seconds")}
-                st.session_state.pop("sync_plan", None)
-                st.success("Current REDCap records and field definitions loaded. Build or refresh the results below.")
-            except Exception as exc:
-                st.error(str(exc))
-        live = st.session_state.get("live")
-        if live and live["connection"] == connection_key:
-            st.caption(f"Using live REDCap snapshot read {live['when']} (preferred over uploaded snapshot).")
-        elif live:
-            st.warning("Connection settings changed; the previous live snapshot will not be used.")
-        st.download_button("Download optional tracking-field definitions", csv_bytes(tracking_dictionary(), DD_COLUMNS), "tracking_fields_to_append.csv", mime="text/csv")
-        st.caption("This is an APPEND-ONLY field fragment, not a replacement project dictionary. Merge these rows into a backup of your full dictionary, or add them in Online Designer. Do not upload this fragment alone as the full project dictionary.")
-
-    rules = render_exclusion_manager(st, api_url, token, oasis_file)
-    reviewed_exclusions = st.checkbox("I reviewed the active exclusion rules", value=False, key="reviewed_rules_" + digest(rules)[:12])
-
-    inferred_date = as_of
-    if oasis_file:
-        found = re.search(r"(20\d{6})", oasis_file.name)
-        if found:
-            try:
-                inferred_date = datetime.strptime(found[1], "%Y%m%d").date()
-            except ValueError:
-                pass
-    through = st.date_input("OASIS export coverage date — verify against the actual export", value=min(inferred_date, as_of), key="coverage_date_" + (digest(oasis_file.name)[:10] if oasis_file else "empty"))
-    confirm_coverage = st.checkbox("These exports cover every selected rotation; a rotation with no rows genuinely has zero entries", value=False, help="Normally leave off. Only needed when an entire cohort has no activity yet. Do not use it to bypass a July/August schedule mismatch.")
-    settings = Settings(as_of=as_of.isoformat(), data_through=through.isoformat(), targets={"cas": cas_target, "hp": hp_target, "handoff": handoff_target}, fallback_rotation_days=fallback_days, grace_days=grace, cohort="active" if cohort_label.startswith("Only") else "all", confirm_coverage=confirm_coverage, exclusions=rules, survey_urls={"cas": cas_url, "hp": hp_url, "handoff": handoff_url}, legacy_partial_links=legacy_links)
+        oasis_file = st.file_uploader("OASIS ME evaluation export", type="csv", key="oasis_upload")
     uploads = [schedule_file, checklist_file, match_file, oasis_file]
-    source_fingerprint = digest([asdict(settings), [hashlib.sha256(f.getvalue()).hexdigest() if f else "" for f in uploads], hashlib.sha256(snapshot_file.getvalue()).hexdigest() if snapshot_file else "", hashlib.sha256(metadata_file.getvalue()).hexdigest() if metadata_file else "", st.session_state.get("live", {}).get("when", "") if live and live["connection"] == connection_key else ""])
-    if st.button("Build / refresh results", type="primary", disabled=not all(uploads)):
+    source_bytes = [f.getvalue() if f is not None else b"" for f in uploads]
+    filenames = [f.name if f is not None else "" for f in uploads]
+    if not token:
+        with st.expander("Optional reference file — only needed when a student's details are missing", expanded=False):
+            st.caption("A full REDCap export, such as the 0959 file, can supply missing student IDs or emails. Your director can connect REDCap once so this loads automatically.")
+            backup = st.file_uploader("REDCap reference export", type="csv", key="simple_backup")
+            st.session_state.backup_reference_bytes = backup.getvalue() if backup is not None else b""
+    backup_bytes = st.session_state.get("backup_reference_bytes", b"")
+    state = ensure_exclusion_state(st.session_state, api_url, token)
+    settings = routine_settings(st.session_state.get("simple_options", {}), filenames, state["rules"])
+    fingerprint = routine_fingerprint(source_bytes, filenames, settings, backup_bytes, connection)
+
+    if st.button("Create reminder files", type="primary", disabled=not all(source_bytes), key="simple_create"):
+        st.session_state.pop("result", None)
+        st.session_state.pop("sync_plan", None)
+        st.session_state.pop("upload_receipts", None)
+        st.session_state.pop("manual_import", None)
         try:
-            with st.spinner("Checking identities, scoring, and matching submissions..."):
-                messages = Messages()
-                data = [read_csv_bytes(f.getvalue(), label, messages) for f, label in zip(uploads, ("Rotation schedule", "Checklist", "Preceptor matches", "OASIS ME"))]
-                snapshot = live["rows"] if live and live["connection"] == connection_key else read_csv_bytes(snapshot_file.getvalue(), "REDCap snapshot", messages) if snapshot_file else []
-                metadata = live["metadata"] if live and live["connection"] == connection_key else Metadata(read_csv_bytes(metadata_file.getvalue(), "Data Dictionary", messages)) if metadata_file else None
-                run = process(*data, snapshot=snapshot, settings=settings, log=messages)
-                files = output_files(run)
-            st.session_state.result = {"run": run, "files": files, "fingerprint": source_fingerprint, "snapshot": snapshot, "metadata": metadata}
-            st.session_state.pop("sync_plan", None)
-            st.session_state.pop("upload_receipts", None)
+            with st.spinner("Checking the files and preparing reminders..."):
+                ref = automatic_reference(st.session_state, api_url, token, refresh=True)
+                reference_rows = ref["rows"]
+                if not ref["connected"] and backup_bytes:
+                    reference_rows = read_csv_bytes(backup_bytes, "Reference export", Messages())
+                state = ensure_exclusion_state(st.session_state, api_url, token)
+                # An uploaded backup can carry saved rules offline; it is not a
+                # replacement for a fresh rule check when a connection is configured.
+                if not token and reference_rows and any(EXCLUSION_FIELD in r for r in reference_rows):
+                    if not changed_rule_students(state["reference"], state["rules"]):
+                        try:
+                            saved_rules = parse_exclusion_snapshot(reference_rows)
+                            state["rules"] = overlay_saved_rules(load_private_rules(), saved_rules.stored)
+                            state["reference"] = state["rules"]
+                            state["error"] = ""
+                        except ValueError as exc:
+                            ref["rules_error"] = str(exc)
+                            state["error"] = str(exc)
+                settings = routine_settings(st.session_state.get("simple_options", {}), filenames, state["rules"])
+                fingerprint = routine_fingerprint(source_bytes, filenames, settings, backup_bytes, connection)
+                run = prepare_routine_run(source_bytes, reference_rows, settings)
+                st.session_state.result = {"run": run, "files": output_files(run), "fingerprint": fingerprint,
+                                           "reference": ref, "rules_verified": not bool(ref["rules_error"]) and (not bool(token) or bool(ref["connected"]))}
         except Exception as exc:
-            st.error(str(exc))
-            st.session_state.pop("result", None)
+            message = str(exc).replace(token, "[REDACTED]") if token else str(exc)
+            st.error("The files could not be processed. Check that each upload is the correct CSV export.")
+            with st.expander("What needs attention", expanded=True):
+                st.write(message)
+
     result = st.session_state.get("result")
-    if not result:
-        st.info("Upload the four files, then build the results. Your original scripts and source exports are never run or modified.")
-        st.stop()
-    if result["fingerprint"] != source_fingerprint:
-        st.warning("Inputs or processing settings changed. Click Build / refresh results before exporting or syncing.")
-        st.stop()
-    run, files = result["run"], result["files"]
-    if run.messages.blocked:
-        st.error("Some inputs need correction. Diagnostic results are visible below; reminder downloads and REDCap writes are disabled.")
-    if through < as_of:
-        st.warning(f"The OASIS export is dated {through.isoformat()}, while this review is as of {as_of.isoformat()}. Evaluations submitted since that export may be missing. Refresh OASIS before sending reminders.")
-    st.subheader("3 · Review the results")
-    overview, reminders, scoring, redcap, diagnostics = st.tabs(["Overview", "Reminder files", "Scores & exclusions", "REDCap update", "Validation"])
-    with overview:
-        cols = st.columns(4)
-        for col, label, value in zip(cols, ("Students", "Clinical forms received", "H&P / handoff forms", "Preceptor reminder rows"), (len(run.roster), sum(e["kind"] == "cas" for e in run.evaluations), sum(e["kind"] != "cas" for e in run.evaluations), len(run.reports["preceptor_reminders"]))):
-            col.metric(label, value)
-        st.dataframe(run.roster, hide_index=True, use_container_width=True)
-        st.dataframe(run.source_stats, hide_index=True, use_container_width=True)
-        st.caption("All students in the selected schedule remain in the roster, including students with no activity. Coverage warnings are not converted into missing requirements.")
-    with reminders:
-        st.write("Three send-ready CSVs. The complete-status tables remain available for tracking.")
-        confirmed = st.checkbox("I reviewed the selected cohort and source freshness before using these reminder files", key="review_reminders_" + source_fingerprint[:10])
-        permitted = confirmed and reviewed_exclusions and not run.messages.blocked
-        titles = [("student_checklist_review.csv", "Encounter-log reminders", "checklist_review"), ("feedback_reminders_power_automate.csv", "Student evaluation / H&P / handoff reminders", "student_review"), ("preceptor_eval_reminders.csv", "Preceptor reminders — one row per preceptor and student", "preceptor_reminders")]
-        for filename, label, report_key in titles:
-            st.markdown(f"**{label}**")
-            st.download_button("Download " + filename, files[filename], filename, mime="text/csv", disabled=not permitted, key=filename)
-            with st.expander("Preview " + label):
-                st.dataframe(run.reports[report_key], hide_index=True, use_container_width=True)
-        st.caption("Combined preceptor rows have separate cas_link, hp_link, and handoff_link fields. Update your Power Automate email body to include every populated link, not just blank_form_link. No handoff link is invented.")
-        st.download_button("Download all reports as ZIP", zipped(files), "clerkship_reports.zip", mime="application/zip", disabled=not permitted)
-    with scoring:
-        st.caption("Clinical score only (maximum 375). NBME, final clerkship grade, deadlines, and manually entered portfolio fields remain under your existing REDCap rules.")
-        st.dataframe(run.reports["scores"], hide_index=True, use_container_width=True)
-        st.download_button("Download clinical score summary", files["clinical_scores.csv"], "clinical_scores.csv", "text/csv", disabled=run.messages.blocked)
-        with st.expander("All submitted evaluations, imputation, and exclusions"):
-            st.dataframe(run.evaluations, hide_index=True, use_container_width=True)
-            st.download_button("Download evaluation audit", files["evaluation_audit.csv"], "evaluation_audit.csv", "text/csv")
-        st.caption("An all-N/A form still counts as received but has no numeric grade. Manual exclusions and the automatically dropped evaluation still suppress repeat reminders; professionalism and low-score flags remain visible.")
-    with redcap:
-        st.write("Existing repeat instances are reused. New instances are appended; unrelated fields and records are not rewritten.")
-        st.caption("Calculations and read-only fields are excluded using the actual REDCap metadata. Without the optional tracking fields, your raw assessment, checklist, and match records can still sync; the additional tracking summary stays downloadable.")
-        replace = st.checkbox("Allow reviewed nonblank source-field changes to replace existing values", value=False)
-        clears = st.checkbox("Allow explicit clearing of stale tracker-owned summary fields", value=False)
-        include_tracking = st.checkbox("Include installed optional cst_ tracking fields", value=True)
-        plan_key = digest([source_fingerprint, replace, clears, include_tracking, bool(result["metadata"])])
-        if st.button("Preview REDCap changes", disabled=run.messages.blocked or not reviewed_exclusions):
-            plan = plan_sync(run, result["snapshot"], result["metadata"], replace_conflicts=replace, allow_clears=clears, include_tracking=include_tracking)
-            st.session_state.sync_plan = {"plan": plan, "key": plan_key, "connection": connection_key if live and live["connection"] == connection_key else ""}
-        saved_plan = st.session_state.get("sync_plan")
-        if saved_plan and saved_plan["key"] != plan_key:
-            st.warning("Sync settings changed. Preview the changes again.")
-            saved_plan = None
-        if saved_plan:
-            plan = saved_plan["plan"]
-            st.write(f"{len(plan.records)} records to add/update · {len(plan.clear_records)} explicit clearing records · {plan.skipped_existing} unchanged or omitted rows")
-            for msg in plan.errors:
-                st.error(msg)
-            for msg in plan.warnings:
-                st.warning(msg)
-            st.dataframe(plan.changes, hide_index=True, use_container_width=True)
-            st.download_button("Download field-change audit", csv_bytes(plan.changes), "redcap_change_audit.csv", "text/csv")
-            # JSON retains sparse record keys. CSV is offered for offline review,
-            # not as a metadata-free, automatically approved production import.
-            payload = {"normal_import": plan.records, "explicit_clears": plan.clear_records, "metadata_validated": result["metadata"] is not None, "warnings": plan.warnings, "errors": plan.errors}
-            st.download_button("Download REDCap update plan (JSON)", json.dumps(payload, indent=2, ensure_ascii=False), "redcap_update_plan.json", "application/json", disabled=bool(plan.errors))
-            live_valid = bool(saved_plan["connection"] and saved_plan["connection"] == connection_key and result["metadata"])
-            if not live_valid:
-                st.info("For direct upload, read the live project above, rebuild the results, and preview again. A token is entered only in the app or its secrets—not in chat.")
-            approve = st.checkbox("I reviewed these changes and authorize this update to the connected REDCap project", key="approve_" + plan_key[:10])
-            upload_enabled = bool(live_valid and approve and not plan.errors and (plan.records or plan.clear_records))
-            if st.button("Upload approved changes to REDCap", type="primary", disabled=not upload_enabled):
-                try:
-                    with st.spinner("Checking for intervening changes, importing, and verifying saved fields..."):
-                        receipts = RedcapClient(api_url, token).upload(plan, run)
-                    st.session_state.upload_receipts = receipts
-                    st.session_state.pop("sync_plan", None)
-                    st.success("Approved changes were imported and verified by reading the saved fields back. Refresh REDCap before preparing another update.")
-                except Exception as exc:
-                    st.error(str(exc))
-                    st.warning("Some batches may already be saved. Refresh the live snapshot before retrying. No automatic retry or rollback is performed.")
-                    st.session_state.pop("sync_plan", None)
-        if st.session_state.get("upload_receipts"):
-            st.dataframe(st.session_state.upload_receipts, hide_index=True, use_container_width=True)
-            st.download_button("Download import receipt", csv_bytes(st.session_state.upload_receipts), "redcap_import_receipt.csv", "text/csv")
-    with diagnostics:
-        st.dataframe(run.messages.rows, hide_index=True, use_container_width=True)
-        st.download_button("Download validation report", files["validation_report.csv"], "validation_report.csv", "text/csv")
-        st.dataframe(run.reports["match_audit"], hide_index=True, use_container_width=True)
-        st.caption("The raw ME export is the scoring/reminder source. The REDCap snapshot is used for identity resolution and safe synchronization; old records are not silently substituted for missing current exports.")
+    current = bool(result and result.get("fingerprint") == fingerprint)
+    if result and not current:
+        st.info("A file or setting changed. Click Create reminder files again to update the downloads.")
+    if current:
+        run = result["run"]
+        readiness = daily_readiness(run)
+        if result["reference"].get("error"):
+            st.info("REDCap is unavailable. Reminder files are being built from the uploads; automatic REDCap updating and verified scoring are unavailable until the connection is restored.")
+        elif not result["rules_verified"]:
+            st.info("Saved grading exclusions need the director's review. Reminder matching is unaffected, but score downloads and REDCap updating are withheld.")
+        if run.messages.blocked:
+            st.error("Some student details could not be matched safely. Review the items below; no reminders will be released until they are corrected.")
+        elif not all(readiness.values()):
+            st.warning("One or more files do not cover the rotation in your schedule. The affected reminder downloads are withheld—not treated as zero completed work.")
+        else:
+            st.success(f"Reminder files prepared for {len(run.roster)} students.")
+        if settings.data_through < settings.as_of:
+            st.warning(f"This OASIS export is dated {settings.data_through}. Assessments submitted after that export may be missing. Use a fresh export before sending reminders.")
+        missing_emails = sum(not s["email"] for s in run.roster)
+        if missing_emails:
+            st.warning(f"{missing_emails} students have no uniquely matched email address and are omitted from the mailing files. Their status is retained in the review table.")
+        missing_preceptor_emails = sum(r["status"] == "Pending" and not r["faculty_email"] for r in run.reports["match_audit"])
+        if missing_preceptor_emails:
+            st.warning(f"{missing_preceptor_emails} pending preceptor requests have no email address and are omitted from the mailing file. Ask the director to review the matching details.")
+        st.subheader("2 · Download reminder files")
+        counts = [sum(r["status"] == "Needs review" and bool(r["email"]) for r in run.reports["checklist_review"]),
+                  sum(r["reminder_needed"] == "Yes" and bool(r["email"]) for r in run.reports["student_review"]),
+                  len(run.reports["preceptor_reminders"])]
+        titles = ["Student encounter-log reminders", "Student evaluation, H&P and handoff reminders", "Preceptor reminders"]
+        for col, name, title, count in zip(st.columns(3), REMINDER_NAMES, titles, counts):
+            with col:
+                st.markdown("**" + title + "**")
+                st.caption(f"{count} reminder rows" if readiness[name] else "Needs matching source files")
+                st.download_button("Download CSV", result["files"][name], name, "text/csv", key="daily_" + name, disabled=not readiness[name])
+        st.download_button("Download all three reminder files", zipped(reminder_only_files(run)), "power_automate_reminders.zip", "application/zip", disabled=not all(readiness.values()), key="simple_all_reminders")
+        st.caption("A file with zero rows has no sendable reminders; check any missing-email or matching warnings. Preceptor rows combine missing assessment types; duplicate matches never create extra rows.")
+        with st.expander("Check students and preview the reminders", expanded=run.messages.blocked):
+            st.dataframe(run.roster, hide_index=True, use_container_width=True)
+            for name, report in (("Encounter status", "checklist_review"), ("Student assessment status", "student_review"), ("Preceptor reminders", "preceptor_reminders")):
+                st.markdown("**" + name + "**")
+                st.dataframe(run.reports[report], hide_index=True, use_container_width=True)
+            with st.container():
+                st.markdown("**File checks and matching details**")
+                st.dataframe(run.messages.rows, hide_index=True, use_container_width=True)
+                st.dataframe(run.source_stats, hide_index=True, use_container_width=True)
+            st.download_button("Download file-check report", result["files"]["validation_report.csv"], "validation_report.csv", "text/csv", key="simple_validation")
+        render_manual_redcap(st, result, source_bytes, settings, fingerprint, api_url, token)
+        if result["rules_verified"]:
+            render_routine_redcap(st, result, api_url, token, source_bytes, settings, fingerprint)
+    elif not result:
+        st.caption("No full-database export or Data Dictionary is required just to create reminders when the students can be identified from the four files. REDCap reads happen automatically when your director has configured the connection.")
+
+    if director:
+        st.divider()
+        render_director_tools(st, api_url, token, oasis_file)
+        # Re-read because editing exclusions can invalidate the former results.
+        result = st.session_state.get("result")
+        if result and result.get("fingerprint") == fingerprint:
+            run = result["run"]
+            with st.expander("Clinical scores and evaluation audit"):
+                if result["rules_verified"] and not run.messages.blocked:
+                    st.dataframe(run.reports["scores"], hide_index=True, use_container_width=True)
+                    st.download_button("Download clinical scores", result["files"]["clinical_scores.csv"], "clinical_scores.csv", "text/csv", key="simple_scores")
+                    st.download_button("Download evaluation audit", result["files"]["evaluation_audit.csv"], "evaluation_audit.csv", "text/csv", key="simple_audit")
+                else:
+                    st.warning("Restore the REDCap/rule connection or correct the inputs before using clinical scores.")
+            with st.expander("Files for older, separate Power Automate preceptor flows"):
+                st.caption("Use this package only with the older separate CAS and observed-H&P flows. Do not also send the combined preceptor file for the same run. The normal three-file package keeps the combined layout from version 1.1.")
+                st.download_button("Download legacy-flow reminder files", zipped(legacy_power_automate_files(run)), "legacy_power_automate_reminders.zip", "application/zip", disabled=not all(daily_readiness(run).values()), key="simple_legacy")
+                st.caption("The legacy package contains the original clinical and observed-H&P preceptor CSV layouts. It does not include preceptor handoff reminders; those remain in the combined file and student requirement reminders.")
 
 
 if __name__ == "__main__":

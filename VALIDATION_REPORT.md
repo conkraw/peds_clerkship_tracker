@@ -1,37 +1,37 @@
-# Validation report — online edition
+# Validation — version 1.3.0
 
-Version 1.1.0 · September 19, 2026
+## Executed automated checks
 
-## Completed checks
+Command:
 
-**110 synthetic automated tests passed**: the 58 original regression tests and 52 additional online-exclusion tests. `TEST_RESULTS.txt` contains the complete test names and output. All Python files passed syntax parsing; the configuration and Secrets template passed TOML parsing.
+```sh
+python -m unittest test_tracker test_online test_simple test_manual -v
+```
 
-The original suite covers CSV normalization, roster resolution, rotation coverage, missing activities, five-domain scoring, unscored forms, imputation, manual exclusions before dropping the lowest evaluation, independent assessment-type reminder matching, duplicate suppression, REDCap repeat-instance matching, conservative update planning, and mocked upload orchestration.
+**199 tests passed**: the 151 existing tests plus 48 manual-import tests. Full results are in `TEST_RESULTS.txt`.
 
-The new suite covers automatic loading of the three original pair-specific rules; name/email and optional source-form/rotation/timestamp restrictions; inactive rules restoring scoring; exclusion followed by automatic dropping; received/excluded assessments suppressing reminders; validated backups; stable rule identities; picker de-duplication; missing or invalid configuration fields; duplicate/longitudinal/repeating records; sparse saved-rule updates; per-student conflict checks; no automatic creation of students; verified persistence across simulated store sessions; unrelated-student changes being preserved; and no automatic retry after a timeout or failed read-back.
+The added tests cover no-token/no-network preparation; valid and missing reference structure; duplicate parent IDs; wrong rotation; longitudinal/unsupported reference forms; preserving existing repeat instances; appending after the existing maximum; preventing duplicate imports with an updated reference; source-conflict preservation; unavailable/ambiguous mapping; proper CSV header order, quoting, Unicode, and line-break round trips; explicit integer identities; no blank clearing; no duplicate target rows; optional dictionary validation and coded-identity matching; saved/current exclusion rules and conflicts; and conditional UI downloads after reference confirmation.
 
-**The persistence tests use a fake, in-memory REDCap API.** They verify payloads and error handling but do not establish that a real token has the required permissions or that the institutional server is reachable.
+The UI-control tests use a small simulated Streamlit API. They exercise the manual option after an API-read failure, independent reminder generation, no automatic REDCap preparation during reminder generation, no network call on a manual download, reference changes invalidating old results, and optional use of an already-read reference. They are **not tests of Streamlit's actual browser renderer**.
 
-## Check against the supplied CSV samples
+## Supplied-file local regression
 
-The updated processing pipeline was run on the four supplied source CSVs and the full 0959 REDCap export without modifying them. It retained the 11 scheduled students and processed 126 submitted assessments in the selected rotation. The three built-in rules loaded successfully.
+The latest source files and 0959 reference were processed with version 1.2 and version 1.3 locally; the original standalone scripts were not executed. No live endpoint was contacted.
 
-As expected, the July 6 schedule and August 31 checklist/matching cohorts do not align. The checklist and student solicitation status were **Coverage not confirmed**; zero preceptor reminder rows were generated. Those source files are illustrative inputs, not a matched set for sending reminders. No source student CSVs or resulting individual-level reports are included in this package.
+- All **553 clinical assessment totals**, imputation values, manual-exclusion flags, and automatic-drop flags matched version 1.2.
+- The bytes of all three reminder CSVs were identical between versions for the comparison run.
+- The original July schedule combined with the August checklist/matches was correctly blocked for a manual import, not treated as zero completed work.
+- For a separate regression only, a matching August 31 roster of **12 students** was derived from existing parent rows in the supplied reference. This produced a locally validated **95-row** manual-import plan (13 clinical-evaluation rows and 82 checklist rows), with no plan errors. CSV serialization round-tripped to the exact planned values. This was an offline preparation test, not an actual import.
+- No generated student-data CSVs or source records from these tests are included in the package. Aggregate regression results are in `validation_metrics.json`.
 
-## Not tested or performed
+## Not verified
 
-- Streamlit could not be installed in this execution environment. A direct PyPI installation attempt also found no available package versions. Therefore real browser rendering, widget interactions, Streamlit session lifecycle behavior, and cloud deployment have **not** been tested here. No private application URL was created.
-- No live REDCap record or metadata request, live import, or live exclusion save was performed. Existing records, instrument settings, permissions, and institutional network access were not changed.
-- No email was sent. Generated reminders are not proof of delivery.
-- No new claim of parity with REDCap's final clerkship-grade/NBME formulas is made. This update preserves the app's clinical-evaluation calculation, not unseen server formulas.
-- The Dockerfile is supplied for administrator review; an image was not built or deployed.
+Streamlit is not installed in this build environment. No actual Streamlit browser session, Community Cloud deployment, or browser download was exercised. The UI tests use simulated controls.
 
-## Production checks
+No live REDCap server was contacted. No records, definitions, or exclusion settings were changed. REDCap's actual manual import, project-specific field validation, API configuration, and user permissions remain untested. An optional Data Dictionary improves the app's checks; without it, field types and choice codes are not fully validated by the app.
 
-Use approved private hosting and test with synthetic inputs before student data. Confirm that the deployment restricts viewers, has a private repository, and uses private Secrets. Add the internal non-repeating `cst_exclusion_rules` notes field in an approved test project, verify save/reload/deactivate behavior, then review a small intended live update before production use.
+An offline snapshot cannot establish whether data changed after export. Use a current full raw export, prevent intervening imports/edits, and inspect REDCap's real-time comparison table. Keep existing IDs and set **Overwrite data with blank values: NO**. If REDCap rejects fields or shows unexpected values, stop and review the mappings rather than bypassing validation.
 
-Rule-saving conflict checks are optimistic, not a REDCap-side atomic transaction. Avoid simultaneous editing of one student's exclusions. A timeout can occur after a server write; read back and reconcile before retrying.
+No Power Automate flow was executed. The existing reminder CSV outputs were preserved, not the unseen production flow configuration independently verified.
 
-## Confidential package content
-
-There are no source student CSVs or actual API credentials in the package. The Python source **does** embed the three requested historical exclusions with student IDs/names and preceptor names. The source repository and any image built from it must remain private. `.gitignore` does not remove embedded identifiers.
+The portfolio PDF does not expose every calculation expression. Existing REDCap final-grade and exclusion calculations have not been replaced or certified. Test a small approved import and inspect the resulting review form before production use.

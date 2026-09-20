@@ -1,11 +1,6 @@
 {
-  "version": "1.1.0",
-  "confidential_builtin_rules": true,
+  "version": "1.3.0",
   "files": {
-    ".dockerignore": {
-      "bytes": 84,
-      "sha256": "8dae25047e50c910e64251c8d0d0dd3fe0c57180c78dca4d95c2b2979d446829"
-    },
     ".gitignore": {
       "bytes": 371,
       "sha256": "07d82b13b97c775e3de30be1ca2cd81d519c286ebab514f7725319a94b7a51f5"
@@ -18,61 +13,69 @@
       "bytes": 608,
       "sha256": "24af79e88fc03b323ac577fbd12d2184470abf10a44f1d1ebdfa9343cfb78ed5"
     },
-    "CHANGELOG.md": {
-      "bytes": 1441,
-      "sha256": "6b5af2bc07844fae4bf55abd6d9af4f3f118f79289712b9fcae5cd7869251880"
+    "ADMIN_QUICK_START.md": {
+      "bytes": 2141,
+      "sha256": "9e1af4728dfd92cbf7b2dd2132d90334f5941642156a7327b810ab26205c9595"
     },
-    "Dockerfile": {
-      "bytes": 590,
-      "sha256": "9a4e614075500caacb04fd8e98d988e7941a01733d501e5ad6c719d871357981"
+    "CHANGELOG.md": {
+      "bytes": 3097,
+      "sha256": "f00c0ec7e6baac3830031ba8e612a208e410f30faab45575996f7a9d3136899b"
+    },
+    "MANUAL_REDCAP_IMPORT.md": {
+      "bytes": 5337,
+      "sha256": "c3710e98a65562bbbd48991ac9675448a8c4c1e8a79057297d50fc097930185d"
     },
     "ONLINE_SETUP.md": {
-      "bytes": 9311,
-      "sha256": "cecce823f48d1a11781f4207a59047d7480321eb36a4207750a4074b8447e42f"
+      "bytes": 6265,
+      "sha256": "f95eb129e6f3e73d2b680fa10341f03865898fa1a770145ba847f117f60d2627"
+    },
+    "PORTFOLIO_NOTES.md": {
+      "bytes": 3960,
+      "sha256": "843dc041f40a1ddffd55987802b05dcceb1a12c2673883dff118be9e0e34031d"
     },
     "README.md": {
-      "bytes": 16335,
-      "sha256": "2c24e18495aa1b1d48a2a080b82a7d2b3adf0f532d276178e76875cd4d22bb22"
-    },
-    "START_WINDOWS.bat": {
-      "bytes": 111,
-      "sha256": "f25217b998c63bb870a14be23e399f8059c5f6b5908843c0469fc48c85e65854"
+      "bytes": 8331,
+      "sha256": "0d0c7366469828210c8384bbef7fbec3a81d6c804a0aeed8387f429faa6fefb6"
     },
     "TEST_RESULTS.txt": {
-      "bytes": 12384,
-      "sha256": "3afdb9a868281f64b97697e11868f318fbdd021c9abf21ec4ad0f21cd0c68b25"
+      "bytes": 23822,
+      "sha256": "47dc8f897800687ca9d248de62400381e6d06fb2514cc7eb934c1f60fff9d602"
     },
     "VALIDATION_REPORT.md": {
-      "bytes": 4226,
-      "sha256": "be4ad72b972aa0573b215f29ad46fccd2d0256d437e7df2661499ce0907cec7a"
-    },
-    "exclusion_field_to_append.csv": {
-      "bytes": 637,
-      "sha256": "8739de135ebb492446453ec8499f79643eda58d49d8451694c0224c2ba08e34a"
+      "bytes": 3849,
+      "sha256": "d0dad7ad19c7f79762395ab9c386c12d8a407968cf459abbfeefbeb2788c506d"
     },
     "peds_clerkship_tracker.py": {
-      "bytes": 121652,
-      "sha256": "6ac58207033792179d8e0ac006336dda875294f5185f5fb2692dc1b9c2ab651d"
+      "bytes": 159244,
+      "sha256": "ec7e78d7d5d77bab407f52da090a61184a4016dfe90cb5c08d98a003efd67bb9"
+    },
+    "redcap_import_instructions.txt": {
+      "bytes": 2343,
+      "sha256": "d2c890a6d057440836c220bc81345c361a7d97bc01ce2beb3a4e99e129f0ce66"
     },
     "requirements.txt": {
       "bytes": 52,
       "sha256": "e8aaed34866031553f32ff56ac11acdb39bae97f433638bdcd7b4971d2ceb86e"
     },
+    "test_manual.py": {
+      "bytes": 20208,
+      "sha256": "2dd265c44fabd23f923357e0fe828728c792f5c22c7283ce2c57af9757f000d5"
+    },
     "test_online.py": {
       "bytes": 18050,
       "sha256": "b41379c04b62c2c727209237b8c0ece84cb59dca40a955b7267f138d415d927c"
+    },
+    "test_simple.py": {
+      "bytes": 20636,
+      "sha256": "8862cef4acdd83a4ca415b575b935b11c5dd462fd71d544f9494cc6ae4084eb2"
     },
     "test_tracker.py": {
       "bytes": 26667,
       "sha256": "d4a371c06fce881d4a3549e0f35a0cd4b54ad6744566690822a96575c960d385"
     },
-    "tracking_fields_to_append.csv": {
-      "bytes": 3439,
-      "sha256": "5441a8e08acc452685fa4a4ac0941c69587c1a9e7662b248567079971d348bfe"
-    },
     "validation_metrics.json": {
-      "bytes": 738,
-      "sha256": "22919632c7ab7307cc77bab51eda4c11e1f08124137bdbf3c5ef69c8e98d7645"
+      "bytes": 766,
+      "sha256": "2a73636e693af3390bb764a83492645e84ff1db8dc79f66981e662bb72601b56"
     }
   }
 }
