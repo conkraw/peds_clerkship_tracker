@@ -1,0 +1,23 @@
+{
+  "version": "1.1.0",
+  "tests_passed": 110,
+  "tests_failed": 0,
+  "original_regression_tests": 58,
+  "online_exclusion_tests": 52,
+  "syntax_check": "passed",
+  "toml_template_check": "passed",
+  "provided_sample": {
+    "scheduled_students": 11,
+    "evaluations_in_selected_rotation": 126,
+    "built_in_active_exclusions": 3,
+    "checklist_status": "Coverage not confirmed",
+    "solicitation_status": "Coverage not confirmed",
+    "preceptor_reminder_rows": 0
+  },
+  "live_streamlit_browser_test": false,
+  "cloud_deployment_performed": false,
+  "live_redcap_access_or_write": false,
+  "raw_source_csvs_in_package": false,
+  "api_credentials_in_package": false,
+  "confidential_builtin_student_preceptor_rules_in_source": true
+}

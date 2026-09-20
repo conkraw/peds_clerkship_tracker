@@ -1,0 +1,78 @@
+{
+  "version": "1.1.0",
+  "confidential_builtin_rules": true,
+  "files": {
+    ".dockerignore": {
+      "bytes": 84,
+      "sha256": "8dae25047e50c910e64251c8d0d0dd3fe0c57180c78dca4d95c2b2979d446829"
+    },
+    ".gitignore": {
+      "bytes": 371,
+      "sha256": "07d82b13b97c775e3de30be1ca2cd81d519c286ebab514f7725319a94b7a51f5"
+    },
+    ".streamlit/config.toml": {
+      "bytes": 127,
+      "sha256": "ba05d382241a30ec349e43c2221bdd50bea204218e4037870ad1914f3edd4dd4"
+    },
+    ".streamlit/secrets.toml.example": {
+      "bytes": 608,
+      "sha256": "24af79e88fc03b323ac577fbd12d2184470abf10a44f1d1ebdfa9343cfb78ed5"
+    },
+    "CHANGELOG.md": {
+      "bytes": 1441,
+      "sha256": "6b5af2bc07844fae4bf55abd6d9af4f3f118f79289712b9fcae5cd7869251880"
+    },
+    "Dockerfile": {
+      "bytes": 590,
+      "sha256": "9a4e614075500caacb04fd8e98d988e7941a01733d501e5ad6c719d871357981"
+    },
+    "ONLINE_SETUP.md": {
+      "bytes": 9311,
+      "sha256": "cecce823f48d1a11781f4207a59047d7480321eb36a4207750a4074b8447e42f"
+    },
+    "README.md": {
+      "bytes": 16335,
+      "sha256": "2c24e18495aa1b1d48a2a080b82a7d2b3adf0f532d276178e76875cd4d22bb22"
+    },
+    "START_WINDOWS.bat": {
+      "bytes": 111,
+      "sha256": "f25217b998c63bb870a14be23e399f8059c5f6b5908843c0469fc48c85e65854"
+    },
+    "TEST_RESULTS.txt": {
+      "bytes": 12384,
+      "sha256": "3afdb9a868281f64b97697e11868f318fbdd021c9abf21ec4ad0f21cd0c68b25"
+    },
+    "VALIDATION_REPORT.md": {
+      "bytes": 4226,
+      "sha256": "be4ad72b972aa0573b215f29ad46fccd2d0256d437e7df2661499ce0907cec7a"
+    },
+    "exclusion_field_to_append.csv": {
+      "bytes": 637,
+      "sha256": "8739de135ebb492446453ec8499f79643eda58d49d8451694c0224c2ba08e34a"
+    },
+    "peds_clerkship_tracker.py": {
+      "bytes": 121652,
+      "sha256": "6ac58207033792179d8e0ac006336dda875294f5185f5fb2692dc1b9c2ab651d"
+    },
+    "requirements.txt": {
+      "bytes": 52,
+      "sha256": "e8aaed34866031553f32ff56ac11acdb39bae97f433638bdcd7b4971d2ceb86e"
+    },
+    "test_online.py": {
+      "bytes": 18050,
+      "sha256": "b41379c04b62c2c727209237b8c0ece84cb59dca40a955b7267f138d415d927c"
+    },
+    "test_tracker.py": {
+      "bytes": 26667,
+      "sha256": "d4a371c06fce881d4a3549e0f35a0cd4b54ad6744566690822a96575c960d385"
+    },
+    "tracking_fields_to_append.csv": {
+      "bytes": 3439,
+      "sha256": "5441a8e08acc452685fa4a4ac0941c69587c1a9e7662b248567079971d348bfe"
+    },
+    "validation_metrics.json": {
+      "bytes": 738,
+      "sha256": "22919632c7ab7307cc77bab51eda4c11e1f08124137bdbf3c5ef69c8e98d7645"
+    }
+  }
+}

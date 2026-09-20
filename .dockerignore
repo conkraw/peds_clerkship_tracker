@@ -1,0 +1,5 @@
+*
+!requirements.txt
+!peds_clerkship_tracker.py
+!.streamlit/
+!.streamlit/config.toml
