@@ -1,63 +1,133 @@
-# Pediatric Clerkship Reminders — version 1.3, with manual REDCap import
+# Pediatric Clerkship Tracker — fresh project edition
 
-## Update the deployed app
+Version 2.0.0 • schema `clerkship_flat_v1`
 
-Replace the existing `peds_clerkship_tracker.py` in the deployed GitHub branch with this package's file, keeping the same filename and folder. Dependencies are unchanged. Keep your existing Streamlit Secrets. The full package also includes tests and the updated guides; these are not required to launch the app.
+**Four CSV uploads → Create files → reminder downloads + REDCap import CSV.**
 
-Keep the repository private: the Python source retains the three student-specific exclusions requested by the owner. Do not commit student source CSVs, generated reminders, tokens, or actual secrets files.
+No REDCap API, full-project export, metadata upload, old-project reconciliation,
+repeat-instance numbering or import-history file is required. REDCap does not
+need to exist before the app can process data. The existing processing, scoring
+and mailing rules were retained; the interface and REDCap export are rebuilt.
 
-## Routine use
+## Replace the deployed app
+Replace **both** `peds_clerkship_tracker.py` and `requirements.txt` in the current
+private repository. Keep the existing entry-point filename and folder. Commit
+the changes; Streamlit Community Cloud monitors its connected repository.
+Use Python 3.11 or 3.12. Existing valid `APP_PASSWORD` Secrets can remain.
+No REDCap API setting is used; any old REDCap Secrets are unnecessary.
+Do not commit a real `.streamlit/secrets.toml` file. The included `.example` is
+only a template. An app password does not replace institution-approved hosting
+and authorized viewer access.
 
-Upload the rotation schedule, updated checklist, preceptor matches, and OASIS ME evaluation CSV. Click **Create reminder files**. Download the three individual CSVs or the single reminder ZIP. Do not change director settings for an ordinary run.
+Only the app and requirements are required for deployment. The optional
+`.streamlit/config.toml` caps uploads and disables usage statistics. No local
+exclusion sidecar file is needed. Keep the repository **private**: the Python
+source retains the three original student-specific exclusion rules by request.
+Never add source student CSVs, output CSVs, passwords or tokens to the repository.
 
-The default downloads are:
+Local development (not required for online users):
 
-| Filename | Contents |
-| --- | --- |
-| `student_checklist_review.csv` | Students with missing, incomplete, or insufficient-participation encounter logs. |
-| `feedback_reminders_power_automate.csv` | One row per student needing additional clinical-assessment, observed H&P, or handoff solicitations/submissions. |
-| `preceptor_eval_reminders.csv` | One combined row per preceptor–student pair, listing outstanding assessment types. Any received matching assessment suppresses that assessment reminder. Duplicate matches do not create extra obligations. |
+```bash
+python -m pip install -r requirements.txt
+python -m streamlit run peds_clerkship_tracker.py
+```
 
-The ZIP contains only these mailing files, not grades or raw assessment narratives. Files with zero rows contain no sendable reminders; review any missing-email or matching warnings before concluding everyone is complete. The app creates files. It does not send email or claim that an email has been delivered.
+## Inputs and normal outputs
+See `ADMIN_QUICK_START.md`. The routine upload fields are rotation schedule,
+updated checklist, preceptor matches, and OASIS ME evaluation export. The rotation
+schedule selects the students. Include an external ID and email when available;
+otherwise the other sources must resolve them uniquely. A name-only student with
+no other source activity cannot be reliably assigned an ID or mailing address.
+An omitted end date is resolved from matching sources, then defaults to a
+26-calendar-day inclusive rotation. The director can change that fallback.
 
-## REDCap is separate
+The three primary mailing CSVs keep their preceding Streamlit layouts. Director
+downloads include clinical scores, evaluation audit, checklist entries, matches,
+all-student statuses, tracking status, validation notices, roster and source
+summary. The optional older separate CAS/H&P flow layouts remain available, but
+must not be sent alongside the combined-preceptor file for the same batch.
 
-When the director has configured `REDCAP_API_URL` and `REDCAP_API_TOKEN` in Streamlit Secrets, clicking Create reads the current REDCap reference and field definitions automatically. No separate full-export or Data Dictionary upload is needed. Reading never imports records.
+Existing clinical/observed-H&P survey links are retained. No handoff survey URL
+was supplied: that link remains blank until configured by the director.
+Prefilled score shortcuts remain off unless the director enables the legacy
+option. The app never emails anyone or marks a mailing as sent.
 
-Without a configured connection, the four source files still generate reminders when student IDs/emails can be resolved. A student with no entries in any source cannot be identified from a name alone; use the optional reference export or have the director enable automatic lookup. Do not store the 0959 database export in the repository.
+## Scoring and exclusions
+Five equally weighted clinical domains yield up to 375 points. Missing domains
+are mean-imputed from the available observed domains for calculation only;
+original scores are preserved. All missing means unscorable, not zero.
+Manual exclusions occur before the automatic lowest-evaluation drop. Exactly
+one lowest evaluation is dropped if at least four scorable, non-manually-excluded
+evaluations remain. Ties use submission date and source Form Record. Clinical
+scores are not final clerkship grades; this app does not invent NBME, late-penalty
+or final-grade inputs. Individual low scores and professionalism flags remain
+visible for director review, including on excluded evaluations.
 
-To update REDCap after reviewing the reminders, open **Update REDCap — optional**, click **Review REDCap update**, approve the proposed changes, and click **Confirm update to REDCap**. New tracking fields are not required. Existing raw-data instruments are reused. A failed REDCap connection or sync preview does not invalidate otherwise valid reminder files. If saved exclusions cannot be verified, the API-based score exports and updates are withheld, not the reminder matching. The manual path can independently validate saved rules from a current full export.
+The three original student–preceptor exclusion rules load automatically.
+**Show director tools → Exclusions** allows adding a pair-specific or submitted-
+form-specific rule, toggling its active flag, and updating a reason. Rules never
+exclude a preceptor globally across other students. Received evaluations still
+suppress reminders even when excluded or automatically dropped.
 
-## Manual REDCap import — no API required
+New changes are browser-session-only unless saved externally. Download the
+exclusions backup after editing; restore it next time, or paste its complete JSON
+into the `EXCLUSIONS_JSON` Streamlit Secret to use it as the startup default.
+That Secret replaces the entire startup rule set, including deactivated rules.
+Keep it absent to retain the built-in defaults. There is no automatic database
+save. The REDCap summary stores the rules used for audit, but this app does not
+read them back from REDCap.
 
-After creating reminders, open **Download REDCap import file — no API required**. Upload a **current full REDCap export (CSV)** from the destination project, confirm that it includes all records and repeating instances and that no data has changed since export, and click **Prepare REDCap import file**. Review the result and select **Download REDCap import CSV**. The generated filename is `redcap_import.csv`.
+## New REDCap project
+The package includes a **complete matching Data Dictionary** with 142 fields,
+an empty column template, and a synthetic example import. Upload the dictionary
+to a NEW classic project, not the existing project. No repeating instruments or
+events are used. See `REDCAP_SETUP.txt` for detailed import settings.
 
-The full export is needed only for this optional import, not for ordinary reminder downloads. It supplies the current student record IDs and existing repeating-instance numbers. Use raw variable names and raw coded values, not a labeled or filtered report. The older 0959 file illustrates the structure; get a fresh export for actual use. The review-form PDF is not a substitute for the data export.
+Every item has a separate ordinary record: student summary, clinical evaluation,
+observed H&P, handoff, checklist entry, or preceptor match. The `student_key`
+links all records for one student and rotation. Filter `record_type = 1` to
+review one summary row per student; summaries also contain readable individual
+assessment and checklist detail. A summary record is not a repeating parent.
 
-If a current reference was already uploaded or read from REDCap during reminder generation, it can be reused without an extra API call. An uploaded reference takes priority. A Data Dictionary is optional unless the app needs it to resolve coded identities; without it, field and choice validation must be completed in REDCap. No new tracking instrument is required.
+The importer contains all evaluations, INCLUDING manual exclusions, with clear
+numeric inclusion flags. This deliberately differs from the original script's
+omission of manually excluded evaluations from its REDCap upload. No received
+assessment is erased merely because its score is excluded.
 
-In REDCap, open **Applications → Data Import Tool**, choose a real-time import with the comparison table, keep the supplied record IDs, and set **Overwrite data with blank values: NO**. Upload `redcap_import.csv`, inspect the changes, and only then approve the import. Do not upload it to the Data Dictionary. Full instructions are in `MANUAL_REDCAP_IMPORT.md` and are downloadable in the app.
+Each `record_id` is a 128-bit digest of the source identity, with a record-type
+prefix. It is not a row number and does not change when source rows are reordered.
+Existing items keep their IDs when scores, comments or exclusion flags change.
+Preserve these IDs during import. Fields containing raw source JSON preserve
+additional OASIS answers and checklist columns without requiring extra fields.
 
-The file contains proposed new or changed values, not a replacement for the entire database. Existing source conflicts are preserved and flagged; blank cells do not request deletion. Mismatched rotations, unknown student records, and ambiguous repeat mappings prevent an import file from being released. An offline export cannot detect later server changes: do not allow intervening edits/imports, and get a new full export before preparing the next batch. A download is never treated as evidence that data was imported.
+**Overwrite data with blank values = YES in this new generated-only project.**
+This clears obsolete generated values (for example, a previously dropped form).
+Store any manual notes, NBME data and final decisions on a separate instrument,
+with field names absent from the import. Do not reuse this overwrite instruction
+in the old project. Review the real-time import comparison table before saving.
 
-## Director tools
+### Limits of an offline import
+Use complete source exports. A file download is not an import confirmation.
+No offline app can see edits made directly in REDCap. Missing rows are not deleted
+by later imports. Changes to identifying fields can leave older rows in REDCap;
+filter `batch_id` for the desired run or reconcile those rows manually. Import the
+newest batch last. Do not calculate grades by summing every historical detail
+record. Current summary rows reflect the uploaded snapshot and exclusions.
 
-The sidebar's **Show director tools** option exposes exclusions, processing options, and connection diagnostics. It is a layout switch, not a separate authorization boundary. All app viewers must be authorized to access the student data.
+## Tests and examples
+Run `python -m unittest discover -v` in this directory. Processing tests require
+only the standard library; interface tests use a small fake Streamlit, NOT a real
+browser or Streamlit AppTest. See `VALIDATION_REPORT.md` for the actual results.
+The `examples/` folder contains fictional data only and is not a mailing input.
+Use it to check a new development REDCap project before any real student import.
+The live Streamlit/cloud UI and the live REDCap import have not been tested here.
 
-The original three student–preceptor exclusions still load automatically. Additional rules can be added, deactivated, restored, and saved using the existing exclusion manager. Persistent rule saving still requires the previously documented `cst_exclusion_rules` Notes Box field; it is not required for routine reminders or for the three built-in rules. Unsaved changes and processing-option overrides are session-only. Save rules to REDCap to retain them between sessions, or download and later restore the exclusion-manager JSON backup when API saving is unavailable. The manual data-import CSV does not save exclusion configuration.
+## Documentation references
+Streamlit repository updates:
+https://docs.streamlit.io/deploy/streamlit-community-cloud/manage-your-app/edit-your-app
 
-## Existing Power Automate flows
+Streamlit Secrets:
+https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management
 
-The default three-file layout is unchanged from version 1.1. The combined preceptor email should display all populated `cas_link`, `hp_link`, and `handoff_link` values; `blank_form_link` contains only the first available link. The older checklist fields are still present, with additional `participation_review_items` and `incomplete_items` fields. Include these in the current checklist email body.
-
-For flows that still use the original separate clinical-assessment and observed-H&P files, the director workspace includes **Download legacy-flow reminder files**. This alternative ZIP preserves the original checklist/student headers and separate CAS and H&P preceptor layouts, including `observed_hp_reminders.csv`. New incomplete/unknown-participation issues are folded into the old checklist message field. Use either this legacy package or the default combined-preceptor package for a given run, not both. The legacy package does not send preceptor handoff reminders; the main combined output and student reminders retain handoff tracking. No handoff survey URL was supplied, so none is invented. Empty partial-form links are intentional unless the director explicitly enables the old rating-prefilled links.
-
-Your actual Power Automate flows were not available to run or inspect. CSV schemas were checked against the supplied examples; test one reminder through the intended flow before bulk sending.
-
-## Checks retained
-
-The 8/2/1 targets, ten encounter categories, observation-only exceptions, 375-point scoring, imputation, automatic lowest-score drop, and manual exclusions are retained. The code still prevents fuzzy student matching, treats unconfirmed source coverage as unknown rather than zero, keeps stable existing REDCap repeat instances, and requires explicit approval for writes.
-
-The July schedule and August checklist/matching samples remain a mismatched set and are intentionally not released as a complete mailing run. Use matching, current exports.
-
-See `MANUAL_REDCAP_IMPORT.md` for the no-API import workflow, `ADMIN_QUICK_START.md` for the short administrator guide, `ONLINE_SETUP.md` for one-time configuration, `PORTFOLIO_NOTES.md` for the review-form mapping and limitations, and `VALIDATION_REPORT.md` for what was actually tested.
+CU Anschutz REDCap Data Import Tool:
+https://redcapucdenver.zendesk.com/hc/en-us/articles/31248111520276-Data-Import-Tool

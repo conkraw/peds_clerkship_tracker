@@ -1,81 +1,31 @@
 {
-  "version": "1.3.0",
+  "version": "2.0.0",
   "files": {
-    ".gitignore": {
-      "bytes": 371,
-      "sha256": "07d82b13b97c775e3de30be1ca2cd81d519c286ebab514f7725319a94b7a51f5"
-    },
-    ".streamlit/config.toml": {
-      "bytes": 127,
-      "sha256": "ba05d382241a30ec349e43c2221bdd50bea204218e4037870ad1914f3edd4dd4"
-    },
-    ".streamlit/secrets.toml.example": {
-      "bytes": 608,
-      "sha256": "24af79e88fc03b323ac577fbd12d2184470abf10a44f1d1ebdfa9343cfb78ed5"
-    },
-    "ADMIN_QUICK_START.md": {
-      "bytes": 2141,
-      "sha256": "9e1af4728dfd92cbf7b2dd2132d90334f5941642156a7327b810ab26205c9595"
-    },
-    "CHANGELOG.md": {
-      "bytes": 3097,
-      "sha256": "f00c0ec7e6baac3830031ba8e612a208e410f30faab45575996f7a9d3136899b"
-    },
-    "MANUAL_REDCAP_IMPORT.md": {
-      "bytes": 5337,
-      "sha256": "c3710e98a65562bbbd48991ac9675448a8c4c1e8a79057297d50fc097930185d"
-    },
-    "ONLINE_SETUP.md": {
-      "bytes": 6265,
-      "sha256": "f95eb129e6f3e73d2b680fa10341f03865898fa1a770145ba847f117f60d2627"
-    },
-    "PORTFOLIO_NOTES.md": {
-      "bytes": 3960,
-      "sha256": "843dc041f40a1ddffd55987802b05dcceb1a12c2673883dff118be9e0e34031d"
-    },
-    "README.md": {
-      "bytes": 8331,
-      "sha256": "0d0c7366469828210c8384bbef7fbec3a81d6c804a0aeed8387f429faa6fefb6"
-    },
-    "TEST_RESULTS.txt": {
-      "bytes": 23822,
-      "sha256": "47dc8f897800687ca9d248de62400381e6d06fb2514cc7eb934c1f60fff9d602"
-    },
-    "VALIDATION_REPORT.md": {
-      "bytes": 3849,
-      "sha256": "d0dad7ad19c7f79762395ab9c386c12d8a407968cf459abbfeefbeb2788c506d"
-    },
-    "peds_clerkship_tracker.py": {
-      "bytes": 159244,
-      "sha256": "ec7e78d7d5d77bab407f52da090a61184a4016dfe90cb5c08d98a003efd67bb9"
-    },
-    "redcap_import_instructions.txt": {
-      "bytes": 2343,
-      "sha256": "d2c890a6d057440836c220bc81345c361a7d97bc01ce2beb3a4e99e129f0ce66"
-    },
-    "requirements.txt": {
-      "bytes": 52,
-      "sha256": "e8aaed34866031553f32ff56ac11acdb39bae97f433638bdcd7b4971d2ceb86e"
-    },
-    "test_manual.py": {
-      "bytes": 20208,
-      "sha256": "2dd265c44fabd23f923357e0fe828728c792f5c22c7283ce2c57af9757f000d5"
-    },
-    "test_online.py": {
-      "bytes": 18050,
-      "sha256": "b41379c04b62c2c727209237b8c0ece84cb59dca40a955b7267f138d415d927c"
-    },
-    "test_simple.py": {
-      "bytes": 20636,
-      "sha256": "8862cef4acdd83a4ca415b575b935b11c5dd462fd71d544f9494cc6ae4084eb2"
-    },
-    "test_tracker.py": {
-      "bytes": 26667,
-      "sha256": "d4a371c06fce881d4a3549e0f35a0cd4b54ad6744566690822a96575c960d385"
-    },
-    "validation_metrics.json": {
-      "bytes": 766,
-      "sha256": "2a73636e693af3390bb764a83492645e84ff1db8dc79f66981e662bb72601b56"
-    }
+    ".gitignore": "9186b83513ebe23dcd8325497c4545962758abbe029bd0fd2a0ba2c7e0e7d29a",
+    ".streamlit/config.toml": "f4740bb772efe9fd83d180d3a46fac87232db06126ff1293c8ea9af2c7991297",
+    ".streamlit/secrets.toml.example": "f609c4eda1a5109aaeeebdd74d78a83f14660c75512023207731134a3d75c7e8",
+    "ADMIN_QUICK_START.md": "54652d5ca4324210d10b46e69451512f13bac4e3ac85f294b0ac7cebb7d567d9",
+    "README.md": "ad736052d1692c871a072c0a92cf75a75a535a719f9fc38ceeb77caa2a6d8028",
+    "REDCAP_SETUP.txt": "0864f1065b4fa217598a69dba5aa31657a6bcd9732d89bf3fb10dc6c47fd8e6f",
+    "TEST_RESULTS.txt": "a2dc524dd4103e027b8dc14a965163dbf4f0f49a769cd490794bced667d7f0e2",
+    "VALIDATION_REPORT.md": "b586ee6a393a0b3ea40acff6656b313347fb0857fc17cbda49e04a125e3963d8",
+    "examples/README.md": "fcc94173131b88b07dd2d6cb4e50aa7abad97c20852aab9dfb9bd52cfc54b96d",
+    "examples/feedback_reminders_power_automate.csv": "194fd460509a1a0a07c6b39cad21ade3ead5135bbd29719e0b7910f0386e0c3a",
+    "examples/oasis_me_DEMO_20260919.csv": "64618bc62fd45b56808f5225caf6e002b28133829acc50e810d1f5235c7cbcfd",
+    "examples/preceptor_eval_reminders.csv": "a265c1f5e9892a70fa6bba9d143927cfd6b7a3b5b4abdb48780b028213c6efc4",
+    "examples/preceptor_matches_DEMO.csv": "0381cb18c24609156b196bf57eedb791162b1f69bfb0797ca79d71d3beac731f",
+    "examples/redcap_import_EXAMPLE.csv": "43cc70b344325d62a0f317605f065d29c8687074a974458d9a130f26bd57548a",
+    "examples/rotation_schedule_DEMO.csv": "5fe517fc9ee1e1516441ee82d7c404ebf4de69014a27b4eb817092ad3a098352",
+    "examples/student_checklist_review.csv": "58e31da9d5235f9eb87dbfe40b920dc78275396266491cb0c99b0413b8da5b25",
+    "examples/updated_checklist_DEMO.csv": "85beb61ad820dd86d10e759689e467d0b89f412f95173c11b1ceab1d5fae49c1",
+    "peds_clerkship_tracker.py": "84762cc0160ba2162d88babcd265e9d3d7b63f616e4f294e8b1c8eac7df0919c",
+    "redcap_data_dictionary.csv": "45b7fede51280e642b8df31e28f380614127a159034a29a9415afc8b8c6cb053",
+    "redcap_import_TEMPLATE.csv": "853b340d25da8c9ffdddc35bf954f712fbbf2dfb3367c7304fdbed54cc2bcd6f",
+    "requirements.txt": "8439b5c89553c2adc41c3da8d6ef2d40e07236adabaeadf9b8e0a22ee944bfd7",
+    "test_core.py": "241090dc71e3dcfecd80da83e0be87f66d9a2e7fefab54323766dad83c46d787",
+    "test_interface.py": "eaf71b9e6723d013cec23f5accc852342943864dc6303cc1182dc6cca9020df6",
+    "test_new_project.py": "e2cd8afd216d3fc5e3946b88ddb05a49a07e08bddd505afdf3654ad47223eb9b",
+    "test_rules.py": "37b6e7cee12906b2e9d7d6f9009a58c0bf9f0c4a7864fd7755b9fc7fe6f3ff66",
+    "validation_metrics.json": "8fec700ff5a5dbe28ebda4efecdbd332cf6ae7c6b4397bcc87811533eaa6cbeb"
   }
 }

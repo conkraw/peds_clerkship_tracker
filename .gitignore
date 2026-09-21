@@ -1,21 +1,17 @@
-# The Python source itself contains student-specific exclusion rules.
-# This .gitignore is NOT a substitute for a PRIVATE repository.
-.streamlit/secrets.toml
-.env
-.env.*
-!.env.example
+# The source itself contains private student-specific exclusions: PRIVATE repo only.
 __pycache__/
 *.py[cod]
 .venv/
-venv/
-*.log
-*.zip
+.env
+.streamlit/secrets.toml
+secrets.toml
+private_exclusions.json
+exclusions_backup.json
 *.csv
-!tracking_fields_to_append.csv
-!exclusion_field_to_append.csv
-*.json
-!MANIFEST.json
-!validation_metrics.json
-uploads/
-data/
+!redcap_data_dictionary.csv
+!redcap_import_TEMPLATE.csv
+!examples/*.csv
+*.zip
+!*.zip.example
 outputs/
+uploads/

@@ -1,3 +1,3 @@
-streamlit>=1.40,<2
-requests>=2.32,<3
+# Python 3.11 or 3.12 recommended. No REDCap client or API library required.
+streamlit>=1.50,<2
 tzdata>=2024.1

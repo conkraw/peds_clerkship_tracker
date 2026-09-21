@@ -1,25 +1,42 @@
-# Clerkship reminders and optional REDCap import
+# Clerkship tracker: admin instructions
 
-## Every reminder run
+## Regular workflow
+Open the approved staff-only app and sign in. Upload the rotation schedule,
+updated checklist, preceptor match file, and OASIS ME export. Use complete files
+covering the same rotation. Click **Create files**.
 
-1. Open the app and sign in.
-2. Upload the **rotation schedule**, **updated checklist**, **preceptor match file**, and **OASIS ME evaluation export** for the same rotation.
-3. Click **Create reminder files** and check the warnings.
-4. Download the three reminder CSVs, or **Download all three reminder files**, and use them in your configured Power Automate flows.
+Download **all three reminder files**, then unzip them into the folder used by
+Power Automate. Review the displayed row counts and file-check notices first.
+The ZIP contains only these mailing files:
 
-No API token, Data Dictionary, or full REDCap export is required for an ordinary run when the uploaded files identify all students. Ask the director about missing-email or mismatched-rotation warnings. A blank file does not establish completion when warnings are present.
+| File | Used for |
+|---|---|
+| `student_checklist_review.csv` | Students with missing or insufficient encounter logging |
+| `feedback_reminders_power_automate.csv` | Student requests for evaluations, observed H&Ps and handoffs |
+| `preceptor_eval_reminders.csv` | Missing preceptor assessments, combined per student–preceptor pair |
 
-## To update REDCap without an API
+The filenames, columns and reminder text match the preceding Streamlit app.
+Use the latest generated set; do not send both the combined-preceptor files and
+the optional older separate-flow files for the same run. A file with only a
+header means no reminders were found in the selected, verified source data.
 
-1. Get a fresh **full raw-data CSV export** from the same REDCap project. It must include all student records, fields, and repeating instances. Do not use only a rotation report or the student-review PDF.
-2. In the app, open **Download REDCap import file — no API required**. Upload that export, confirm it is complete/current, then select **Prepare REDCap import file**.
-3. Review the checks and download **redcap_import.csv**.
-4. In REDCap, open **Applications → Data Import Tool**. Use **real-time import**, show the **comparison table**, **keep existing record IDs**, and set **Overwrite data with blank values: NO**. Upload the CSV directly, review it, then confirm the import.
+## REDCap, only after the director creates the new project
+Click **Download REDCap import file**. Import this unchanged CSV into the NEW
+project using the settings in `REDCAP_SETUP.txt`. No API token, existing REDCap
+export or dictionary upload to the app is needed. Do not use the old project.
+Creating the CSV does not upload records or send messages.
 
-Do not import when REDCap shows unexpected new student records, unexplained changes, or validation errors. Ask the director. Get a new full export before the next batch, or whenever someone changes the project data. Do not open and resave the import CSV in Excel. The full instructions are in `MANUAL_REDCAP_IMPORT.md`.
+## A file-check notice
+Different rotation dates usually mean the wrong source files were selected.
+Get the matching complete exports; do not assume missing source rows mean the
+student did nothing. A director can confirm that an empty export really covers
+the rotation. If a student's ID or email is unknown, the source needs correction.
+The app will not invent an email recipient. Keep the OASIS Form Record column.
 
-## API upload is still optional
+## Leave director tools alone during routine use
+The director manages exclusions, target counts, dates and detailed score review.
+Changing a file or an exclusion means clicking **Create files** again. The app
+hides stale downloads after source/settings changes.
 
-When configured by the director, **Update REDCap — optional** retains the existing preview-and-confirm upload workflow. You do not need to use that section for manual imports.
-
-This app does not send email. Downloading a reminder or import file does not mark it as sent or imported. Keep the files private and store them only in approved locations.
+Keep source CSVs and generated outputs in approved restricted storage. They do
+not belong in the GitHub repository. Sign out when finished.
