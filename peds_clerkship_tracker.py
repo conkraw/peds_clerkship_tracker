@@ -29,7 +29,7 @@ from typing import Any
 from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 SCHEMA_VERSION = "clerkship_flat_v1"
 
 
@@ -335,7 +335,7 @@ class Settings:
     confirm_coverage: bool = False  # explicitly attests absent whole-cohort data means zero
     exclusions: list[dict] = field(default_factory=lambda: normalize_rules(LEGACY_EXCLUSIONS))
     survey_urls: dict = field(default_factory=lambda: dict(SURVEYS))
-    legacy_partial_links: bool = False
+    legacy_partial_links: bool = True
 
 
 def source_identity(row: dict, role: str) -> dict:
@@ -839,6 +839,7 @@ REMINDER_NAMES = (
     "student_checklist_review.csv",
     "feedback_reminders_power_automate.csv",
     "preceptor_eval_reminders.csv",
+    "observed_hp_reminders.csv",
 )
 
 
@@ -873,48 +874,154 @@ def daily_readiness(run: Run) -> dict[str, bool]:
         run.coverage["matches"].get(s["start_date"], False)
         and run.coverage["oasis"].get(s["start_date"], False) for s in run.roster)
     return {REMINDER_NAMES[0]: checks, REMINDER_NAMES[1]: assessments,
-            REMINDER_NAMES[2]: assessments}
+            REMINDER_NAMES[2]: assessments, REMINDER_NAMES[3]: assessments}
 
 
-def legacy_power_automate_files(run: Run) -> dict[str, bytes]:
-    """Optional original layouts for flows set up before the combined-preceptor app.
+# Fixed mailing contracts copied from the four CSV examples supplied by the owner.
+# Never add audit or REDCap fields to these lists. The detailed exports are separate.
+LEGACY_CHECKLIST_COLUMNS = [
+    "record_id", "name", "email", "missing_items", "observing_only_items",
+    "missing_items_delimiter", "observing_only_items_delimiter", "status",
+    "missing_count", "observing_only_count",
+]
+LEGACY_STUDENT_COLUMNS = [
+    "record_id", "student_name", "email", "reminderob", "remindercas",
+    "reminderhandoff", "random_preceptor", "preceptor_shoutout",
+]
+REMINDER_COLUMNS = {
+    "student_checklist_review.csv": LEGACY_CHECKLIST_COLUMNS,
+    "feedback_reminders_power_automate.csv": LEGACY_STUDENT_COLUMNS,
+    "preceptor_eval_reminders.csv": LEGACY_CAS_COLUMNS,
+    "observed_hp_reminders.csv": LEGACY_HP_COLUMNS,
+}
 
-    Never use these and the combined-preceptor file to send the same reminder run.
-    A student/preceptor can have one CAS row and one HP row in separate flows.
-    No handoff preceptor survey URL was provided in the user's original flow.
+
+def reminder_csv_bytes(rows: list[dict], columns: list[str]) -> bytes:
+    """Match the supplied CSVs: UTF-8 without BOM, CRLF, one row per line.
+
+    Retain the original comma-free Flow values and <br> delimiters. All fields
+    pass through flow_value; REDCap and audit exports do not use this serializer.
+    Even an empty result has the complete, fixed header in the original order.
     """
-    reports = output_files(run)
-    checks = [r for r in run.reports["checklist_review"] if r["status"] == "Needs review" and r["email"]]
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=columns, extrasaction="ignore", lineterminator="\r\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: flow_value(row.get(name, "")) for name in columns})
+    return out.getvalue().encode("utf-8")
+
+
+def original_faculty_list(names: list[str]) -> str:
+    names = sorted({text(name) for name in names if text(name)})
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return names[0] + " and " + names[1]
+    return " ; ".join(names[:-1]) + " ; and " + names[-1]
+
+
+def original_student_note(kind: str, count: int, target: int, names: list[str]) -> str:
+    """Restore the wording in the uploaded student-reminder template.
+
+    Counts still come from the deduplicated request/submission union. No stale
+    example counts, recipients or preceptors are copied into a new mailing.
+    """
+    complete = {
+        "hp": "Observed H&P requirement complete. Thank you for documenting your observed history and physical experiences.",
+        "cas": "Clinical Assessment of Student requirement complete. Thank you for consistently requesting and documenting feedback during the clerkship.",
+        "handoff": "Pediatric Clerkship Handoff requirement complete. Thank you for documenting your handoff experience during the clerkship.",
+    }
+    if count >= target:
+        return complete[kind]
+    label = LABELS[kind]
+    activity = "observed history and physical" if kind == "hp" else label
+    noun = "solicitation" if kind == "handoff" else "solicitations"
+    faculty = original_faculty_list(names)
+    middle = f" Documented {activity} activity is currently associated with {faculty}." if faculty else ""
+    return (f"{label} - our records currently show {count} documented {noun} or submission"
+            + ("." if kind == "handoff" else "s.")
+            + middle + f" Students are expected to have {target} documented {activity} "
+            + ("solicitation or submission" if kind == "handoff" else "solicitations or submissions")
+            + " during the clerkship.")
+
+
+def reminder_files(run: Run) -> dict[str, bytes]:
+    """Four original mailing files; CAS and observed H&P are NEVER combined.
+
+    Matching, receipt checks and grading stay in the processing core. This is an
+    export adapter only: one pending CAS row and/or one pending H&P row per
+    student/preceptor, and no reminder for an assessment already received.
+    Handoffs remain in the student reminder and in the detailed audit/REDCap data.
+    """
     check_rows = []
-    for r in checks:
-        r = dict(r)
-        # Older encounter flows do not have the newer incomplete/unknown columns.
-        # Put those issues into the original missing-items message as well.
-        issues = [r["missing_items"]] if r["missing_items"] else []
-        if r["participation_review_items"]:
-            issues.append("Participation level needs review: " + r["participation_review_items"])
-        if r["incomplete_items"]:
-            issues.append("Logged but not marked complete: " + r["incomplete_items"])
-        r["missing_items"] = "<br>".join(issues)
-        check_rows.append(r)
-    students = [r for r in run.reports["student_review"] if r["reminder_needed"] == "Yes" and r["email"]]
+    for original in run.reports["checklist_review"]:
+        # The owner's checklist template includes Complete rows as well as
+        # Needs review rows. Keep both; do not represent unknown coverage as zero.
+        if original["status"] not in {"Complete", "Needs review"} or not original["email"]:
+            continue
+        row = dict(original)
+        issues = [row["missing_items"]] if row["missing_items"] else []
+        # Keep these actionable checks visible without adding new Flow columns.
+        if row.get("participation_review_items"):
+            issues.append("Participation level needs review: " + row["participation_review_items"])
+        if row.get("incomplete_items"):
+            issues.append("Logged but not marked complete: " + row["incomplete_items"])
+        row["missing_items"] = "<br>".join(issues)
+        check_rows.append(row)
+    check_rows.sort(key=lambda r: (r["name"], r["record_id"]))
+
+    faculty = defaultdict(set)
+    for match in run.matches:
+        if match["eval_period_start_date"] <= run.settings.as_of:
+            faculty[(match["record_id"], match["kind"])].add(display_name(match["faculty_name"]))
+    for evaluation in run.evaluations:
+        faculty[(evaluation["record_id"], evaluation["kind"])].add(display_name(evaluation["evaluator"]))
+    students = []
+    for original in run.reports["student_review"]:
+        if original["reminder_needed"] != "Yes" or not original["email"]:
+            continue
+        row = dict(original)
+        for kind, column in (("hp", "reminderob"), ("cas", "remindercas"), ("handoff", "reminderhandoff")):
+            row[column] = original_student_note(kind, int(row[kind + "_credit"]),
+                                                run.settings.targets[kind], list(faculty[(row["record_id"], kind)]))
+        # Match the shoutout URL encoding in the user's original export.
+        row["preceptor_shoutout"] = text(row.get("preceptor_shoutout")).replace("+", "%20")
+        students.append(row)
+    students.sort(key=lambda r: (r["start_date"], r["student_name"], r["record_id"]))
+
     cas_rows, hp_rows = [], []
+    seen = {"cas": set(), "hp": set()}
     for row in run.reports["preceptor_reminders"]:
         pending = set(row["evaluation_type"].split("; "))
         for kind, target in (("cas", cas_rows), ("hp", hp_rows)):
             if LABELS[kind] not in pending:
                 continue
+            identity = (row["record_id"], row["rotation_start"], norm(row["faculty_email"]))
+            if identity in seen[kind]:
+                continue
+            seen[kind].add(identity)
             link = row[kind + "_link"]
-            new = {**row, "evaluation_type": FORM_NAMES[kind], "expected_eval_count": 1,
-                   "completed_eval_count": 0, "pending_eval_count": 1, "duplicate_match_flag": "",
-                   "reminder_note": f"The student reported working with you. In the records through {row['data_through']}, we have not received the corresponding {LABELS[kind]} assessment.",
-                   "blank_form_link": link,
-                   "partial_form_link": link + "&complete=1&ph=3&ch=3&pp=3&cp=3" if run.settings.legacy_partial_links and link else ""}
-            target.append(new)
-    return {REMINDER_NAMES[0]: csv_bytes(check_rows, CHECKLIST_COLUMNS[:10], flow=True),
-            REMINDER_NAMES[1]: csv_bytes(students, STUDENT_COLUMNS[:8], flow=True),
-            REMINDER_NAMES[2]: csv_bytes(cas_rows, LEGACY_CAS_COLUMNS, flow=True),
-            "observed_hp_reminders.csv": csv_bytes(hp_rows, LEGACY_HP_COLUMNS, flow=True)}
+            note = ("The student reported working with you - but we have not yet received the corresponding evaluation."
+                    if kind == "cas" else
+                    "The student indicated that you observed an H&P encounter with them - but we have not yet received the corresponding formative assessment.")
+            target.append({**row, "evaluation_type": FORM_NAMES[kind],
+                           "expected_eval_count": 1, "completed_eval_count": 0, "pending_eval_count": 1,
+                           "duplicate_match_flag": "", "reminder_note": note, "blank_form_link": link,
+                           "partial_form_link": link + "&complete=1&ph=3&ch=3&pp=3&cp=3"
+                           if run.settings.legacy_partial_links and link else ""})
+    for rows in (cas_rows, hp_rows):
+        rows.sort(key=lambda r: (r["student_name"], r["faculty_name"], r["faculty_email"]))
+    rows_by_file = {"student_checklist_review.csv": check_rows,
+                    "feedback_reminders_power_automate.csv": students,
+                    "preceptor_eval_reminders.csv": cas_rows, "observed_hp_reminders.csv": hp_rows}
+    return {name: reminder_csv_bytes(rows_by_file[name], REMINDER_COLUMNS[name]) for name in REMINDER_NAMES}
+
+
+def legacy_power_automate_files(run: Run) -> dict[str, bytes]:
+    """Backward-compatible function name: the original layouts are now the default."""
+    return reminder_files(run)
 
 
 def exclusion_choices(raw_oasis: list[dict]) -> dict[str, dict]:
@@ -1022,13 +1129,9 @@ def tracking_rows(run: Run) -> list[dict]:
 
 
 def output_files(run: Run) -> dict[str, bytes]:
-    """Keep the three current mailing layouts and messages unchanged."""
-    checks = [r for r in run.reports["checklist_review"] if r["status"] == "Needs review" and r["email"]]
-    students = [r for r in run.reports["student_review"] if r["reminder_needed"] == "Yes" and r["email"]]
+    """Original four mailing layouts plus unchanged, separately named detailed files."""
     return {
-        REMINDER_NAMES[0]: csv_bytes(checks, CHECKLIST_COLUMNS, flow=True),
-        REMINDER_NAMES[1]: csv_bytes(students, STUDENT_COLUMNS, flow=True),
-        REMINDER_NAMES[2]: csv_bytes(run.reports["preceptor_reminders"], PRECEPTOR_COLUMNS, flow=True),
+        **reminder_files(run),
         "all_student_checklist_status.csv": csv_bytes(run.reports["checklist_review"], CHECKLIST_COLUMNS, flow=True),
         "all_student_requirement_status.csv": csv_bytes(run.reports["student_review"], flow=True),
         "clinical_scores.csv": csv_bytes(run.reports["scores"]),
@@ -1470,7 +1573,7 @@ def settings_from_options(options: dict, filenames: list[str], rules: list[dict]
                     fallback_rotation_days=int(options.get("rotation_days", 26)), grace_days=int(options.get("grace_days", 0)),
                     confirm_coverage=bool(options.get("confirm_coverage", False)), exclusions=normalize_rules(rules),
                     survey_urls={k: options.get(k + "_url", SURVEYS[k]) for k in KINDS},
-                    legacy_partial_links=bool(options.get("legacy_partial_links", False)))
+                    legacy_partial_links=bool(options.get("legacy_partial_links", True)))
 
 
 def build_bundle(source_bytes: list[bytes], filenames: list[str], settings: Settings) -> dict:
@@ -1576,7 +1679,7 @@ def director_controls(st: Any, oasis_blob: bytes | None) -> None:
             grace = st.number_input("Preceptor reminder grace days", min_value=0, max_value=365, value=int(current.get("grace_days", 0)))
             confirm = st.checkbox("These exports cover the selected rotation even if an entire source has zero rows for that rotation", value=bool(current.get("confirm_coverage", False)))
             urls = {k + "_url": st.text_input(LABELS[k] + " reminder link", value=current.get(k + "_url", SURVEYS[k])) for k in KINDS}
-            partial = st.checkbox("Include original partially prefilled survey links", value=bool(current.get("legacy_partial_links", False)))
+            partial = st.checkbox("Include original partially prefilled survey links", value=bool(current.get("legacy_partial_links", True)))
             if st.form_submit_button("Apply settings"):
                 if through and (day(through) != through or through > as_of.isoformat()):
                     st.error("Enter an export date in YYYY-MM-DD format, no later than the reminder date.")
@@ -1600,11 +1703,11 @@ def render_downloads(st: Any, result: dict) -> None:
     readiness = daily_readiness(run)
     st.subheader("Your files")
     st.caption(f"{len(run.roster)} students • Reminder date {run.settings.as_of} • OASIS reference date {run.settings.data_through or run.settings.as_of}")
-    labels = ("Student encounter reminders", "Student evaluation / H&P / handoff reminders", "Preceptor evaluation reminders")
+    labels = ("Student checklist review", "Student evaluation / H&P / handoff reminders", "Preceptor clinical-evaluation reminders", "Preceptor observed H&P reminders")
     for name, label in zip(REMINDER_NAMES, labels):
-        st.download_button(label, reports[name], name, "text/csv", disabled=not readiness[name], on_click="ignore", width="stretch", key="download_" + name)
+        st.download_button(label + " — " + name, reports[name], name, "text/csv", disabled=not readiness[name], on_click="ignore", width="stretch", key="download_" + name)
     mail_files = {name: reports[name] for name in REMINDER_NAMES}
-    st.download_button("Download all three reminder files", zipped(mail_files), "power_automate_reminders.zip", "application/zip", disabled=not all(readiness.values()), on_click="ignore", width="stretch")
+    st.download_button("Download all four reminder files", zipped(mail_files), "power_automate_reminders.zip", "application/zip", disabled=not all(readiness.values()), on_click="ignore", width="stretch")
     if not all(readiness.values()):
         st.warning("Some files do not cover the rotation dates in the schedule. Use the matching rotation exports; affected downloads are paused.")
     st.divider()
@@ -1631,8 +1734,6 @@ def render_downloads(st: Any, result: dict) -> None:
                 details["redcap_import.csv"] = result["redcap"]
             st.download_button("Download director package", zipped(details), "director_outputs.zip", "application/zip", on_click="ignore")
             st.caption("Contains grades and narratives. Do not use this ZIP as a mailing-input folder.")
-            st.download_button("Download original separate-flow layouts", zipped(legacy_power_automate_files(run)), "legacy_power_automate.zip", "application/zip", disabled=not all(readiness.values()), on_click="ignore")
-            st.caption("Optional older CAS/H&P layouts. Use these OR the combined-preceptor output, not both for the same mailing.")
 
 
 def main() -> None:
@@ -1653,7 +1754,7 @@ def main() -> None:
     st.subheader("1. Upload your files")
     labels = ("Rotation schedule", "Updated checklist", "Preceptor match file", "OASIS ME evaluation export")
     uploads = [st.file_uploader(label, type=["csv"], key="source_" + str(i)) for i, label in enumerate(labels)]
-    st.caption("Use complete exports for the same rotation. Keep the source student IDs and original OASIS Form Record column. Your mailing filenames and columns are unchanged.")
+    st.caption("Use complete exports for the same rotation. Keep the source student IDs and original OASIS Form Record column. The four mailing files use your original columns; clinical-evaluation and observed H&P reminders stay separate.")
     if st.checkbox("Show director tools", key="show_director"):
         director_controls(st, uploads[3].getvalue() if uploads[3] else None)
     st.subheader("2. Create and download")
@@ -1661,7 +1762,7 @@ def main() -> None:
     blobs = [f.getvalue() for f in uploads] if ready else []
     names = [f.name for f in uploads] if ready else ["", "", "", ""]
     settings = settings_from_options(st.session_state["options"], names, st.session_state["rules"])
-    signature = digest([[hashlib.sha256(b).hexdigest() for b in blobs], names, asdict(settings)])
+    signature = digest([VERSION, [hashlib.sha256(b).hexdigest() for b in blobs], names, asdict(settings)])
     if st.button("Create files", type="primary", disabled=not ready, width="stretch", key="create_files"):
         st.session_state.pop("result", None)
         try:
