@@ -1831,7 +1831,7 @@ class GitHubReminderArchive:
     def _check(response: Any, expected: tuple[int, ...] = (200,)) -> None:
         if response.status_code not in expected:
             status = int(response.status_code)
-            raise ReminderArchiveError(f"GitHub archive access failed (HTTP {status}). Check the private repository, branch and token permissions. No save was confirmed.")
+            raise ReminderArchiveError(f"GitHub archive access failed (HTTP {status}). Check the repository, branch and token permissions. No save was confirmed.")
 
     def load(self) -> SavedReminderNames:
         # Confirm the selected repository and branch exist before interpreting a
@@ -1839,8 +1839,8 @@ class GitHubReminderArchive:
         repo = self._request("GET", self.repo_url)
         self._check(repo)
         metadata = self._json(repo)
-        if not isinstance(metadata, dict) or metadata.get("private") is not True:
-            raise ReminderArchiveError("Use a PRIVATE GitHub repository for this app and its reminder archive.")
+        if not isinstance(metadata, dict) or not metadata.get("full_name"):
+            raise ReminderArchiveError("GitHub returned invalid repository metadata; no exclusion list was assumed.")
         branch = self._request("GET", self.repo_url + "/branches/" + quote(self.config.branch, safe=""))
         self._check(branch)
         response = self._request("GET", self.file_url, params={"ref": self.config.branch})
@@ -1987,7 +1987,7 @@ def render_faculty_reminder_controls(st: Any, result: dict | None, state: dict) 
             st.warning(state["error"])
         if not state["configured"]:
             st.caption("Your owner configures this once in Streamlit Settings → Secrets. No names or credentials need to be put into the Python source.")
-            st.code('[reminder_archive]\nrepo = "YOUR_GITHUB_USERNAME/YOUR_PRIVATE_REPOSITORY"\nbranch = "main"\ngithub_token = "PASTE_GITHUB_TOKEN"\nencryption_key = "PASTE_GENERATED_KEY"', language="toml")
+            st.code('[reminder_archive]\nrepo = "YOUR_GITHUB_USERNAME/YOUR_REPOSITORY"\nbranch = "main"\ngithub_token = "PASTE_GITHUB_TOKEN"\nencryption_key = "PASTE_GENERATED_KEY"', language="toml")
         if state["archive"] is None:
             if st.button("Generate one-time encryption key", key="faculty_reminder_generate_key"):
                 try:
@@ -1999,7 +1999,7 @@ def render_faculty_reminder_controls(st: Any, result: dict | None, state: dict) 
             if generated:
                 st.code('encryption_key = "' + generated + '"', language="toml")
                 st.warning("Copy this into Streamlit Secrets and keep a secure backup. Never commit this key to GitHub. Do not replace an existing archive's key with a new one.")
-            st.caption("Use a fine-grained GitHub token limited to the private repository, with Contents: Read and write. Existing APP_PASSWORD and grading-exclusion Secrets stay unchanged. See REMINDER_EXCLUSIONS_SETUP.md.")
+            st.caption("Use a fine-grained GitHub token limited to the selected repository, with Contents: Read and write. Existing APP_PASSWORD and grading-exclusion Secrets stay unchanged. See REMINDER_EXCLUSIONS_SETUP.md.")
             return
         if state["error"]:
             st.button("Retry loading saved list", key="faculty_reminder_retry")
