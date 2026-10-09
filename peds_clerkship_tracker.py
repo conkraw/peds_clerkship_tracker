@@ -1,7 +1,8 @@
 """Pediatric Clerkship — four files in, reminders and NEW-project REDCap CSV out.
 
 Run: streamlit run peds_clerkship_tracker.py
-No REDCap API, database export, repeat numbering, or external storage is used.
+No REDCap API, database export or repeat numbering is used.
+Faculty reminder exclusions use an encrypted GitHub archive configured in Secrets.
 Scoring and mailing logic are retained from the user's supplied application.
 The new REDCap design uses ordinary records with stable source-derived IDs.
 Confidential: the three original student-specific exclusion rules are included.
@@ -9,6 +10,7 @@ Keep this source repository private and use an approved restricted-access host.
 """
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import hmac
@@ -26,10 +28,10 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 SCHEMA_VERSION = "clerkship_flat_v1"
 
 
@@ -1692,8 +1694,383 @@ def director_controls(st: Any, oasis_blob: bytes | None) -> None:
                     st.rerun()
 
 
-def render_downloads(st: Any, result: dict) -> None:
+# ---------------------------------------------------------------------------
+# Faculty REMINDER exclusions — distinct from student/evaluation grading rules.
+# Only encrypted names are written to GitHub. Source files, grading exclusions,
+# grades and the REDCap import are never sent to this archive.
+# ---------------------------------------------------------------------------
+REMINDER_ARCHIVE_PATH = "private_config/faculty_reminder_exclusions.json.enc"
+REMINDER_ARCHIVE_PURPOSE = "pediatric_clerkship_faculty_reminder_exclusions"
+FACULTY_REMINDER_FILES = ("preceptor_eval_reminders.csv", "observed_hp_reminders.csv")
+
+
+class ReminderArchiveError(ValueError):
+    """User-safe error: messages must never include tokens, keys or response bodies."""
+
+
+@dataclass(frozen=True)
+class ReminderArchiveConfig:
+    repo: str
+    github_token: str = field(repr=False)
+    encryption_key: str = field(repr=False)
+    branch: str = "main"
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> "ReminderArchiveConfig":
+        if not hasattr(raw, "get"):
+            raise ReminderArchiveError("The owner needs to add [reminder_archive] in Streamlit Secrets.")
+        repo = text(raw.get("repo"))
+        token, encryption_key = text(raw.get("github_token")), text(raw.get("encryption_key"))
+        branch = text(raw.get("branch")) or "main"
+        if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo) or repo.split("/")[-1] in {".", ".."}:
+            raise ReminderArchiveError("Set reminder_archive.repo to the private GitHub owner/repository name, not a URL.")
+        if not token or not encryption_key or any(v.startswith(("PASTE_", "YOUR_", "CHANGE_ME")) for v in (token, encryption_key)):
+            raise ReminderArchiveError("Add the GitHub token and a generated encryption key to [reminder_archive] in Secrets.")
+        if len(branch) > 200 or any(ord(c) < 32 for c in branch):
+            raise ReminderArchiveError("The reminder archive branch setting is invalid.")
+        cfg = cls(repo=repo, github_token=token, encryption_key=encryption_key, branch=branch)
+        reminder_cipher(cfg.encryption_key)  # Validate before making any network call.
+        return cfg
+
+
+def reminder_cipher(encryption_key: str) -> Any:
+    try:
+        from cryptography.fernet import Fernet
+    except ImportError:
+        raise ReminderArchiveError("Update requirements.txt to install the cryptography package, then restart the app.") from None
+    try:
+        return Fernet(encryption_key.encode("ascii"))
+    except (ValueError, TypeError, UnicodeError):
+        raise ReminderArchiveError("The archive encryption key is invalid. Use a Fernet-generated key, not the app password.") from None
+
+
+def reminder_name_key(value: str) -> str:
+    # These are faculty_name values from the FINAL mailing CSVs. Match case and
+    # spacing, not fuzzy names, email addresses, credentials or unrelated people.
+    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", value)).strip().casefold()
+
+
+def normalize_reminder_names(value: Any) -> list[str]:
+    if not isinstance(value, (list, tuple)) or len(value) > 5000:
+        raise ReminderArchiveError("The faculty reminder list has an invalid format or size; nothing was replaced.")
+    names = {}
+    for item in value:
+        if not isinstance(item, str) or len(item) > 300 or any(ord(c) < 32 for c in item):
+            raise ReminderArchiveError("The faculty reminder list contains an invalid name; nothing was replaced.")
+        label = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", item)).strip()
+        if not label or label.casefold() in {"*", "all", "all faculty", "all preceptors", "all students"}:
+            raise ReminderArchiveError("Select actual faculty names; a blanket exclusion is not supported.")
+        names.setdefault(reminder_name_key(label), label)
+    return sorted(names.values(), key=reminder_name_key)
+
+
+def encrypt_reminder_names(names: list[str], encryption_key: str) -> bytes:
+    payload = {"version": 1, "purpose": REMINDER_ARCHIVE_PURPOSE,
+               "faculty_names": normalize_reminder_names(names)}
+    plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return reminder_cipher(encryption_key).encrypt(plaintext)
+
+
+def decrypt_reminder_names(ciphertext: bytes, encryption_key: str) -> list[str]:
+    from cryptography.fernet import InvalidToken
+    if not isinstance(ciphertext, bytes) or not ciphertext or len(ciphertext) > 900_000:
+        raise ReminderArchiveError("The encrypted reminder file is empty or invalid. Restore the saved file; no empty list was assumed.")
+    try:
+        payload = json.loads(reminder_cipher(encryption_key).decrypt(ciphertext).decode("utf-8"))
+    except (InvalidToken, UnicodeError, ValueError, TypeError):
+        raise ReminderArchiveError("The reminder list could not be decrypted. Check the original encryption key; the archive was not reset.") from None
+    if (not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1
+            or payload.get("purpose") != REMINDER_ARCHIVE_PURPOSE or "faculty_names" not in payload):
+        raise ReminderArchiveError("This encrypted file is not a supported faculty reminder list. Nothing was replaced.")
+    return normalize_reminder_names(payload["faculty_names"])
+
+
+@dataclass(frozen=True)
+class SavedReminderNames:
+    names: tuple[str, ...] = ()
+    sha: str = ""
+    exists: bool = False
+
+
+class GitHubReminderArchive:
+    """Small encrypted Contents-API store; only explicit actions write to GitHub.
+
+    Read failures never become an empty allow-list. Saves merge an add/remove
+    operation with a fresh read and use SHA compare-and-swap; concurrent sessions
+    do not overwrite each other's unrelated changes. No plaintext fallback exists.
+    """
+    def __init__(self, config: ReminderArchiveConfig, transport: Any = None):
+        import requests
+        self.config = config
+        self.transport = transport if transport is not None else requests
+        reminder_cipher(config.encryption_key)
+        self.repo_url = "https://api.github.com/repos/" + config.repo
+        self.file_url = self.repo_url + "/contents/" + REMINDER_ARCHIVE_PATH
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        import requests
+        try:
+            return self.transport.request(method, url, headers={
+                "Accept": "application/vnd.github+json",
+                "Authorization": "Bearer " + self.config.github_token,
+                "X-GitHub-Api-Version": "2026-03-10",
+                "User-Agent": "pediatric-clerkship-reminder-archive",
+                "Cache-Control": "no-cache",
+            }, timeout=(5, 20), allow_redirects=False, **kwargs)
+        except requests.RequestException:
+            raise ReminderArchiveError("GitHub could not be reached. No save was confirmed. Refresh the saved list before downloading preceptor reminders.") from None
+
+    @staticmethod
+    def _json(response: Any) -> Any:
+        try:
+            return response.json()
+        except (ValueError, TypeError):
+            raise ReminderArchiveError("GitHub returned an unreadable response. No exclusion list was assumed.") from None
+
+    @staticmethod
+    def _check(response: Any, expected: tuple[int, ...] = (200,)) -> None:
+        if response.status_code not in expected:
+            status = int(response.status_code)
+            raise ReminderArchiveError(f"GitHub archive access failed (HTTP {status}). Check the private repository, branch and token permissions. No save was confirmed.")
+
+    def load(self) -> SavedReminderNames:
+        # Confirm the selected repository and branch exist before interpreting a
+        # missing file as first-time setup. GitHub also returns 404 for bad access.
+        repo = self._request("GET", self.repo_url)
+        self._check(repo)
+        metadata = self._json(repo)
+        if not isinstance(metadata, dict) or metadata.get("private") is not True:
+            raise ReminderArchiveError("Use a PRIVATE GitHub repository for this app and its reminder archive.")
+        branch = self._request("GET", self.repo_url + "/branches/" + quote(self.config.branch, safe=""))
+        self._check(branch)
+        response = self._request("GET", self.file_url, params={"ref": self.config.branch})
+        if response.status_code == 404:
+            return SavedReminderNames()  # NOT ready: explicit first-time initialization is required.
+        self._check(response)
+        obj = self._json(response)
+        if (not isinstance(obj, dict) or obj.get("type") != "file" or obj.get("encoding") != "base64"
+                or not isinstance(obj.get("sha"), str) or not re.fullmatch(r"[a-fA-F0-9]{40,64}", obj["sha"])
+                or not isinstance(obj.get("content"), str) or len(obj["content"]) > 1_300_000):
+            raise ReminderArchiveError("The saved reminder file has an unexpected GitHub format. It was not treated as an empty list.")
+        try:
+            ciphertext = base64.b64decode(re.sub(r"\s+", "", obj["content"]), validate=True)
+        except (ValueError, TypeError):
+            raise ReminderArchiveError("The encrypted reminder file is damaged. Nothing was replaced.") from None
+        return SavedReminderNames(tuple(decrypt_reminder_names(ciphertext, self.config.encryption_key)), obj["sha"], True)
+
+    def _write(self, names: list[str], previous: SavedReminderNames) -> Any:
+        # The *only* content written is base64 wrapping authenticated ciphertext.
+        # Neither names nor counts are placed in filenames or commit messages.
+        ciphertext = encrypt_reminder_names(names, self.config.encryption_key)
+        payload = {"message": "Update encrypted faculty reminder preferences",
+                   "content": base64.b64encode(ciphertext).decode("ascii"), "branch": self.config.branch}
+        if previous.exists:
+            payload["sha"] = previous.sha
+        return self._request("PUT", self.file_url, json=payload)
+
+    def initialize(self) -> SavedReminderNames:
+        previous = self.load()
+        if previous.exists:
+            return previous  # Never erase an existing archive through initialization.
+        response = self._write([], previous)
+        if response.status_code in (409, 422):
+            current = self.load()
+            if current.exists:
+                return current
+        self._check(response, (200, 201))
+        current = self.load()
+        if not current.exists:
+            raise ReminderArchiveError("The new archive could not be verified. Do not assume it was saved.")
+        return current
+
+    def change(self, *, add: list[str] | None = None, remove: list[str] | None = None) -> SavedReminderNames:
+        additions, removals = normalize_reminder_names(add or []), normalize_reminder_names(remove or [])
+        added_keys, removed_keys = {reminder_name_key(n) for n in additions}, {reminder_name_key(n) for n in removals}
+        if added_keys & removed_keys:
+            raise ReminderArchiveError("A faculty name cannot be excluded and restored in the same change.")
+        for _ in range(3):
+            previous = self.load()
+            if not previous.exists:
+                raise ReminderArchiveError("The saved reminder list is missing. Restore it or complete first-time setup; no replacement was created.")
+            merged = {reminder_name_key(n): n for n in previous.names if reminder_name_key(n) not in removed_keys}
+            for name in additions:
+                merged.setdefault(reminder_name_key(name), name)
+            names = normalize_reminder_names(list(merged.values()))
+            if names == list(previous.names):
+                return previous  # Idempotent action: no redundant commit.
+            response = self._write(names, previous)
+            if response.status_code in (409, 422):
+                continue  # Re-read and apply this operation, never replay a stale full list.
+            self._check(response, (200, 201))
+            verified = self.load()
+            current_keys = {reminder_name_key(n) for n in verified.names}
+            if not verified.exists or not added_keys <= current_keys or removed_keys & current_keys:
+                raise ReminderArchiveError("The saved list changed again before verification. Refresh it and check the selected names.")
+            return verified
+        raise ReminderArchiveError("Another update or a branch protection rule prevented saving. Refresh the list and try again; no successful save was confirmed.")
+
+
+def read_faculty_mailing_rows(data: bytes, filename: str) -> list[dict]:
+    if filename not in FACULTY_REMINDER_FILES:
+        raise ReminderArchiveError("Only the two faculty reminder files may be filtered.")
+    try:
+        reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig"), newline=""))
+        if reader.fieldnames != REMINDER_COLUMNS[filename]:
+            raise ReminderArchiveError("A preceptor reminder layout changed unexpectedly. Download is paused to protect the original format.")
+        rows = list(reader)
+        if any(None in r or any(v is None for v in r.values()) for r in rows):
+            raise ReminderArchiveError("A preceptor reminder row is malformed. Download is paused.")
+        return rows
+    except (csv.Error, UnicodeError):
+        raise ReminderArchiveError("A preceptor reminder file could not be read. Download is paused.") from None
+
+
+def faculty_reminder_choices(reports: dict[str, bytes]) -> list[str]:
+    # Derive choices from the same faculty_name columns the administrator sees.
+    names = [r["faculty_name"] for filename in FACULTY_REMINDER_FILES if filename in reports
+             for r in read_faculty_mailing_rows(reports[filename], filename) if r["faculty_name"].strip()]
+    return normalize_reminder_names(names)
+
+
+def apply_faculty_reminder_exclusions(reports: dict[str, bytes], names: list[str]) -> tuple[dict[str, bytes], dict[str, int]]:
+    """Filter final mailing rows only. Never mutate Run, scores or REDCap data.
+
+    The original columns, values, ordering, encoding and CRLF line endings remain.
+    With no exclusions (or no matching name), the original bytes are returned.
+    """
+    blocked = {reminder_name_key(n) for n in normalize_reminder_names(names)}
+    result, removed = dict(reports), {filename: 0 for filename in FACULTY_REMINDER_FILES}
+    for filename in FACULTY_REMINDER_FILES:
+        if filename not in reports:
+            raise ReminderArchiveError("A required preceptor reminder file is missing. Download is paused.")
+        original = read_faculty_mailing_rows(reports[filename], filename)
+        kept = [r for r in original if reminder_name_key(r["faculty_name"]) not in blocked]
+        removed[filename] = len(original) - len(kept)
+        if removed[filename]:
+            out = io.StringIO(newline="")
+            writer = csv.DictWriter(out, fieldnames=REMINDER_COLUMNS[filename], lineterminator="\r\n")
+            writer.writeheader()
+            writer.writerows(kept)  # Already Flow-safe: do not sanitize a second time.
+            result[filename] = out.getvalue().encode("utf-8")
+    return result, removed
+
+
+def reminder_archive_state(st: Any) -> dict:
+    """Fresh per-rerun read; never share decrypted names in a global Streamlit cache."""
+    state = {"ready": False, "archive": None, "saved": SavedReminderNames(), "error": "", "configured": False}
+    try:
+        raw = st.secrets.get("reminder_archive", None)
+    except (FileNotFoundError, KeyError):
+        raw = None
+    if raw is None:
+        state["error"] = "One-time setup is needed to save faculty reminder exclusions in GitHub."
+        return state
+    state["configured"] = True
+    try:
+        archive = GitHubReminderArchive(ReminderArchiveConfig.from_mapping(raw))
+        state["archive"] = archive
+        state["saved"] = archive.load()
+        state["ready"] = state["saved"].exists
+    except ReminderArchiveError as exc:
+        state["error"] = str(exc)
+    return state
+
+
+def render_faculty_reminder_controls(st: Any, result: dict | None, state: dict) -> None:
+    with st.expander("Faculty reminder exclusions — saved for future runs", expanded=False):
+        st.write("Choose a faculty name to stop reminders in BOTH observed_hp_reminders.csv and preceptor_eval_reminders.csv, for all students and rotations. Restore the name here whenever reminders should resume.")
+        st.caption("This is separate from grading exclusions. Scores, received evaluations, student requirement counts and the REDCap import are not changed. Name matching ignores case and extra spaces; two people with the same displayed name share the rule.")
+        flash = st.session_state.pop("faculty_reminder_flash", "")
+        if flash:
+            st.success(flash)
+        if state["error"]:
+            st.warning(state["error"])
+        if not state["configured"]:
+            st.caption("Your owner configures this once in Streamlit Settings → Secrets. No names or credentials need to be put into the Python source.")
+            st.code('[reminder_archive]\nrepo = "YOUR_GITHUB_USERNAME/YOUR_PRIVATE_REPOSITORY"\nbranch = "main"\ngithub_token = "PASTE_GITHUB_TOKEN"\nencryption_key = "PASTE_GENERATED_KEY"', language="toml")
+        if state["archive"] is None:
+            if st.button("Generate one-time encryption key", key="faculty_reminder_generate_key"):
+                try:
+                    from cryptography.fernet import Fernet
+                    st.session_state["faculty_reminder_setup_key"] = Fernet.generate_key().decode("ascii")
+                except ImportError:
+                    st.error("Install the updated requirements.txt first.")
+            generated = st.session_state.get("faculty_reminder_setup_key")
+            if generated:
+                st.code('encryption_key = "' + generated + '"', language="toml")
+                st.warning("Copy this into Streamlit Secrets and keep a secure backup. Never commit this key to GitHub. Do not replace an existing archive's key with a new one.")
+            st.caption("Use a fine-grained GitHub token limited to the private repository, with Contents: Read and write. Existing APP_PASSWORD and grading-exclusion Secrets stay unchanged. See REMINDER_EXCLUSIONS_SETUP.md.")
+            return
+        if state["error"]:
+            st.button("Retry loading saved list", key="faculty_reminder_retry")
+            return
+        saved, archive = state["saved"], state["archive"]
+        if not saved.exists:
+            st.warning("No encrypted reminder list was found on this branch. Create an empty list only for FIRST-TIME setup. If a list existed before, restore that file and its original key instead.")
+            first_time = st.checkbox("This is first-time setup; there is no prior reminder exclusion list to preserve.", key="faculty_reminder_first_time")
+            if st.button("Initialize encrypted reminder list", key="faculty_reminder_initialize", disabled=not first_time):
+                try:
+                    archive.initialize()
+                except ReminderArchiveError as exc:
+                    state["ready"], state["error"] = False, str(exc)
+                    st.error(str(exc))
+                else:
+                    st.session_state.pop("faculty_reminder_setup_key", None)
+                    st.session_state["faculty_reminder_flash"] = "Encrypted storage is ready. Faculty selections will be saved across visits."
+                    st.rerun()
+            return
+        st.caption(f"{len(saved.names)} faculty name(s) currently excluded. Loaded from encrypted GitHub storage.")
+        st.button("Refresh saved list", key="faculty_reminder_refresh")
+        try:
+            candidates = faculty_reminder_choices(result["reports"]) if result and not result["run"].messages.blocked else []
+        except ReminderArchiveError as exc:
+            st.error(str(exc))
+            candidates = []
+        excluded = {reminder_name_key(n) for n in saved.names}
+        available = [n for n in candidates if reminder_name_key(n) not in excluded]
+        widget_version = saved.sha[:12]
+        if available:
+            additions = st.multiselect("Faculty to exclude from future reminders", available, key="faculty_reminder_add_" + widget_version)
+            if st.button("Exclude selected faculty and save", key="faculty_reminder_save_add", disabled=not additions):
+                try:
+                    archive.change(add=additions)
+                except ReminderArchiveError as exc:
+                    state["ready"], state["error"] = False, str(exc)
+                    st.error(str(exc))
+                else:
+                    st.session_state["faculty_reminder_flash"] = "Saved in encrypted GitHub storage. The two preceptor reminder downloads now use the updated list."
+                    st.rerun()
+        else:
+            st.info("Create files to list faculty from the two reminder outputs. Names already excluded stay available below even without uploaded files.")
+        if saved.names:
+            st.dataframe([{"Excluded faculty": n} for n in saved.names], hide_index=True, width="stretch")
+            removals = st.multiselect("Faculty to restore to reminders", list(saved.names), key="faculty_reminder_remove_" + widget_version)
+            if st.button("Remove selected exclusions and save", key="faculty_reminder_save_remove", disabled=not removals):
+                try:
+                    archive.change(remove=removals)
+                except ReminderArchiveError as exc:
+                    state["ready"], state["error"] = False, str(exc)
+                    st.error(str(exc))
+                else:
+                    st.session_state["faculty_reminder_flash"] = "Saved. Restored faculty may appear again when an assessment is still outstanding."
+                    st.rerun()
+        st.caption("Restore removes a name from the active list; older encrypted versions remain in GitHub history. Download new CSVs after changes—files already downloaded or emailed cannot be recalled.")
+
+
+def render_downloads(st: Any, result: dict, reminder_state: dict | None = None) -> None:
     run, reports = result["run"], result["reports"]
+    reminder_state = reminder_state or {"ready": False, "saved": SavedReminderNames(), "error": "Saved reminder exclusions have not been loaded."}
+    archive_ready = bool(reminder_state["ready"])
+    removed = {name: 0 for name in FACULTY_REMINDER_FILES}
+    if archive_ready:
+        try:
+            reports, removed = apply_faculty_reminder_exclusions(reports, list(reminder_state["saved"].names))
+        except ReminderArchiveError as exc:
+            archive_ready = False
+            st.error(str(exc))
+    if not archive_ready:
+        # Do not hand an unfiltered CSV payload to even a disabled download widget.
+        reports = {**reports, **{name: reminder_csv_bytes([], REMINDER_COLUMNS[name]) for name in FACULTY_REMINDER_FILES}}
     if run.messages.blocked:
         for msg in run.messages.rows:
             if msg["level"] == "ERROR":
@@ -1701,6 +2078,10 @@ def render_downloads(st: Any, result: dict) -> None:
         st.download_button("Download file-check report", reports["validation_report.csv"], "validation_report.csv", "text/csv", on_click="ignore")
         return
     readiness = daily_readiness(run)
+    coverage_ready = all(readiness.values())
+    if not archive_ready:
+        for name in FACULTY_REMINDER_FILES:
+            readiness[name] = False
     st.subheader("Your files")
     st.caption(f"{len(run.roster)} students • Reminder date {run.settings.as_of} • OASIS reference date {run.settings.data_through or run.settings.as_of}")
     labels = ("Student checklist review", "Student evaluation / H&P / handoff reminders", "Preceptor clinical-evaluation reminders", "Preceptor observed H&P reminders")
@@ -1708,8 +2089,12 @@ def render_downloads(st: Any, result: dict) -> None:
         st.download_button(label + " — " + name, reports[name], name, "text/csv", disabled=not readiness[name], on_click="ignore", width="stretch", key="download_" + name)
     mail_files = {name: reports[name] for name in REMINDER_NAMES}
     st.download_button("Download all four reminder files", zipped(mail_files), "power_automate_reminders.zip", "application/zip", disabled=not all(readiness.values()), on_click="ignore", width="stretch")
-    if not all(readiness.values()):
+    if not coverage_ready:
         st.warning("Some files do not cover the rotation dates in the schedule. Use the matching rotation exports; affected downloads are paused.")
+    if not archive_ready:
+        st.warning("The two preceptor reminder downloads are paused until the encrypted faculty exclusion list is loaded. Open Faculty reminder exclusions above. Student reminder and REDCap downloads are unaffected by this check.")
+    elif any(removed.values()):
+        st.caption(f"Saved faculty exclusions removed {removed['preceptor_eval_reminders.csv']} clinical-evaluation reminder row(s) and {removed['observed_hp_reminders.csv']} observed H&P reminder row(s).")
     st.divider()
     st.download_button("Download REDCap import file", result["redcap"] or b"", "redcap_import.csv", "text/csv", disabled=not bool(result["redcap"]), on_click="ignore", width="stretch", key="download_redcap")
     if result["redcap"]:
@@ -1730,6 +2115,9 @@ def render_downloads(st: Any, result: dict) -> None:
         with st.expander("Scores and detailed outputs", expanded=False):
             st.dataframe(run.reports["scores"], hide_index=True, width="stretch")
             details = {**reports, "exclusions_backup.json": exclusion_backup(run.settings.exclusions)}
+            if not archive_ready:
+                for filename in FACULTY_REMINDER_FILES:
+                    details.pop(filename, None)
             if result["redcap"]:
                 details["redcap_import.csv"] = result["redcap"]
             st.download_button("Download director package", zipped(details), "director_outputs.zip", "application/zip", on_click="ignore")
@@ -1781,17 +2169,20 @@ def main() -> None:
         except (ValueError, UnicodeError, csv.Error) as exc:
             st.error(str(exc))
     result = st.session_state.get("result")
+    current_result = result if result and ready and result["signature"] == signature else None
+    reminder_state = reminder_archive_state(st)
+    render_faculty_reminder_controls(st, current_result, reminder_state)
     if result:
         if not ready or result["signature"] != signature:
             st.info("The files or settings changed. Click Create files again for updated downloads.")
         else:
-            render_downloads(st, result)
+            render_downloads(st, result, reminder_state)
     with st.expander("New REDCap project — one-time setup", expanded=False):
         st.write("Create a new classic project using this complete Data Dictionary. Do not configure repeating instruments. This template is not for your old project.")
         st.download_button("Download new-project Data Dictionary", csv_bytes(redcap_dictionary(), DD_COLUMNS), "redcap_data_dictionary.csv", "text/csv", on_click="ignore")
         st.download_button("Download REDCap setup and import instructions", REDCAP_HELP.encode(), "REDCAP_SETUP.txt", "text/plain", on_click="ignore")
         st.caption("The import uses one ordinary record per summary or source item, linked by student_key. In the new project's Data Import Tool, preserve the supplied record IDs and enable blank overwriting for these generated fields. Review the comparison table before confirming. Student summary rows include readable evaluation and checklist details.")
-    st.caption("Nothing is emailed or uploaded automatically. Clinical scores are out of 375, not final clerkship grades. Keep this app and its source code restricted to authorized users.")
+    st.caption("No reminders are emailed and no student data is uploaded automatically. Only explicit save buttons write encrypted faculty reminder preferences to GitHub. Clinical scores are out of 375, not final clerkship grades. Keep this app and its source code restricted to authorized users.")
     if st.button("Clear files and sign out", key="signout"):
         st.session_state.clear()
         st.rerun()
