@@ -1753,7 +1753,16 @@ def main() -> None:
     st.caption("Upload four CSV files, create your files, and download. No REDCap connection or reference export required.")
     st.subheader("1. Upload your files")
     labels = ("Rotation schedule", "Updated checklist", "Preceptor match file", "OASIS ME evaluation export")
-    uploads = [st.file_uploader(label, type=["csv"], key="source_" + str(i)) for i, label in enumerate(labels)]
+    source_urls = (
+        "https://redcap.ctsi.psu.edu/redcap_v17.3.9/DataExport/index.php?pid=19389&report_id=70188",
+        "https://oasis.pennstatehealth.net/admin/course/experience_requirement/view_distribution_setup.html",
+        "https://oasis.pennstatehealth.net/admin/course/e_manage/manage_evaluators.html",
+        "https://oasis.pennstatehealth.net/admin/course/e_manage/student_performance/setup_analysis_report.html",
+    )
+    uploads = []
+    for i, (label, url) in enumerate(zip(labels, source_urls)):
+        st.markdown(f"**{i + 1}. {label}** — [Open export website ↗]({url})")
+        uploads.append(st.file_uploader(f"Upload {label} CSV", type=["csv"], key="source_" + str(i)))
     st.caption("Use complete exports for the same rotation. Keep the source student IDs and original OASIS Form Record column. The four mailing files use your original columns; clinical-evaluation and observed H&P reminders stay separate.")
     if st.checkbox("Show director tools", key="show_director"):
         director_controls(st, uploads[3].getvalue() if uploads[3] else None)
