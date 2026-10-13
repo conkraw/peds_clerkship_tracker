@@ -2,9 +2,10 @@
 
 Run: streamlit run peds_clerkship_tracker.py
 No REDCap API is used. Original repeating-record numbering is saved encrypted.
-Faculty reminder exclusions use an encrypted GitHub archive configured in Secrets.
+Evaluation exclusions, faculty reminder exclusions and repeat-number reservations
+use separate encrypted GitHub files with the existing credentials in Secrets.
 Scoring and mailing logic are retained from the user's supplied application.
-The default REDCap output matches the original 30-column repeating-record CSV.
+The default REDCap output retains the original 30 columns and appends reason.
 Confidential: the three original student-specific exclusion rules are included.
 Keep this source repository private and use an approved restricted-access host.
 """
@@ -31,7 +32,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 SCHEMA_VERSION = "clerkship_flat_v1"
 
 
@@ -324,6 +325,56 @@ def merge_rule_updates(current: list[dict], updates: list[dict]) -> list[dict]:
     merged = {r["rule_id"]: r for r in normalize_rules(current)}
     merged.update({r["rule_id"]: r for r in normalize_rules(updates)})
     return normalize_rules(list(merged.values()))
+
+
+def remove_evaluation_exclusions(rules: list[dict], rule_ids: list[str]) -> list[dict]:
+    """Remove only selected grading rules; do not merge defaults back into the result.
+
+    A complete JSON backup (including []) retains these removals when restored.
+    Faculty-reminder exclusions and source evaluations are never modified here.
+    """
+    current = normalize_rules(rules)
+    if not isinstance(rule_ids, (list, tuple)) or any(not isinstance(k, str) for k in rule_ids):
+        raise ValueError("Select exclusions from the current list; no exclusions were removed.")
+    selected = set(rule_ids)
+    known = {r["rule_id"] for r in current}
+    if selected - known:
+        raise ValueError("The exclusion list changed. Select the current rows again; nothing was removed.")
+    return normalize_rules([r for r in current if r["rule_id"] not in selected])
+
+
+def overlapping_exclusions_after_removal(rules: list[dict], rule_ids: list[str]) -> list[dict]:
+    """Return remaining active rules whose scopes can overlap a selected active rule.
+
+    This is deliberately a warning, not permission to remove unselected rules.
+    It handles an all-pair rule alongside a form-specific rule, as well as distinct
+    email, rotation, Form Record and timestamp scopes.
+    """
+    current = normalize_rules(rules)
+    remaining = remove_evaluation_exclusions(current, rule_ids)
+    selected_ids = set(rule_ids)
+    selected = [r for r in current if r["rule_id"] in selected_ids and r["active"]]
+    def overlaps(a: dict, b: dict) -> bool:
+        if a["record_id"] != b["record_id"]:
+            return False
+        if a["evaluator_email"] and b["evaluator_email"]:
+            if a["evaluator_email"] != b["evaluator_email"]:
+                return False
+        elif not name_key(a["evaluator"]) or name_key(a["evaluator"]) != name_key(b["evaluator"]):
+            return False
+        return not any(a[k] and b[k] and a[k] != b[k]
+                       for k in ("rotation_start", "form_record", "submit_date"))
+    return [r for r in remaining if r["active"] and any(overlaps(r, old) for old in selected)]
+
+
+def evaluation_exclusion_label(rule: dict) -> str:
+    student = rule.get("student_name") or rule["record_id"]
+    preceptor = rule.get("evaluator") or rule.get("evaluator_email", "")
+    scope = ("Form " + rule["form_record"] if rule.get("form_record") else
+             "Submission " + rule["submit_date"] if rule.get("submit_date") else "All for this pair")
+    if rule.get("rotation_start"):
+        scope += " / rotation " + rule["rotation_start"]
+    return f"{student} [{rule['record_id']}] — {preceptor} — {scope}" + (" (inactive)" if not rule["active"] else "")
 
 
 @dataclass
@@ -1514,7 +1565,7 @@ LEGACY_EVAL_COLUMNS = [
     "do", "kp", "prof", "cas_strengths", "cas_weaknesses", "iv", "tot", "epa_student",
     "epa_evaluator", "epa_evaluator_email", "epa_submit_date", "epa_evaluation",
     "epa_obh_score", "epaobh_weaknesses", "epa_obp_score", "epaobp_weaknesses",
-    "epa_obho_score", "epaobho_weaknesses", "exclude",
+    "epa_obho_score", "epaobho_weaknesses", "exclude", "reason",
 ]
 REPEAT_COLUMNS = LEGACY_EVAL_COLUMNS[:3]
 CAS_EXPORT_COLUMNS = LEGACY_EVAL_COLUMNS[3:18]
@@ -1690,6 +1741,52 @@ def legacy_candidates(run: Run) -> list[dict]:
     return result
 
 
+def evaluation_exclusion_reasons(run: Run) -> dict[str, str]:
+    """Readable parent-level reasons for active exclusions affecting this run.
+
+    Match with the SAME student/preceptor/form/date logic used for grading. Do
+    not copy a student's rule to another student or rotation. Keep every distinct
+    applicable rule/reason, including overlapping pair-wide and form-specific
+    rules. Nothing from the faculty-reminder archive is included.
+    """
+    roster = {norm(s["record_id"]): s for s in run.roster}
+    blocks: dict[str, list[str]] = {rid: [] for rid in roster}
+    by_student: dict[str, list[dict]] = defaultdict(list)
+    for e in run.evaluations:
+        if e["kind"] == "cas":
+            by_student[norm(e["record_id"])].append(e)
+    for rule in normalize_rules(run.settings.exclusions):
+        rid = rule["record_id"]
+        if not rule["active"] or rid not in roster:
+            continue
+        student = roster[rid]
+        if rule["rotation_start"] and rule["rotation_start"] != student["start_date"]:
+            continue
+        matched = [e for e in by_student[rid] if exclusion_matches(rule, e)]
+        if not matched:
+            continue  # an inactive, stale, or other-rotation form was not excluded in this run
+        student_name = student.get("student_name") or rule["student_name"] or rid
+        preceptor = rule["evaluator"] or matched[0].get("evaluator") or rule["evaluator_email"]
+        forms = sorted({text(e.get("form_record")) for e in matched if text(e.get("form_record"))})
+        missing_ids = sorted({text(e.get("submit_date")) for e in matched if not text(e.get("form_record"))})
+        if rule["form_record"]:
+            form_text = rule["form_record"]
+        elif rule["submit_date"]:
+            form_text = (", ".join(forms) or "Form Record unavailable") + " (submitted " + rule["submit_date"] + ")"
+        else:
+            form_text = "All clinical evaluations for this student–preceptor pair"
+            if forms:
+                form_text += "; matched Form Records: " + ", ".join(forms)
+        if missing_ids and not rule["form_record"] and not rule["submit_date"]:
+            form_text += "; Form Record unavailable for submission(s): " + ", ".join(missing_ids)
+        block = (f"Student: {student_name} (record_id: {rid})\n"
+                 f"Preceptor: {preceptor}\n"
+                 f"Form: {form_text}\n"
+                 f"Reason: {rule['reason']}")
+        blocks[rid].append(block)
+    return {rid: "\n\n".join(items) for rid, items in blocks.items()}
+
+
 def plan_legacy_exports(run: Run, registry: dict) -> dict:
     """Pure plan. Callers must persist the returned registry before handing out numbered imports."""
     if run.messages.blocked or not run.roster or not all(daily_readiness(run).values()):
@@ -1767,18 +1864,21 @@ def plan_legacy_exports(run: Run, registry: dict) -> dict:
         if absent:
             warnings.append(f"{form}: {absent} previously numbered entries are absent from this run. An import will not delete them; check completeness or reconcile deleted/corrected source items.")
     rendered.sort(key=lambda r: (r["record_id"], r["redcap_repeat_instrument"], int(r["redcap_repeat_instance"])))
-    # Only >=4 rules appear in the exact original-shaped CSV. A separate two-column
-    # update carries blank rules when the old rule genuinely needs to be cleared.
-    exclusions = [{"record_id": s["record_id"], "exclude": s["exclude"]} for s in run.reports["scores"]]
+    # Parent rows combine the automatic-drop description with manual-exclusion
+    # reasons. A separate, narrowly scoped update also carries intentional blanks
+    # when the last rule/reason is removed. Repeating assessment rows stay intact.
+    reasons = evaluation_exclusion_reasons(run)
+    exclusions = [{"record_id": s["record_id"], "exclude": s["exclude"],
+                   "reason": reasons.get(norm(s["record_id"]), "")} for s in run.reports["scores"]]
     evaluation_rows = [r for r in rendered if r["redcap_repeat_instrument"] in {"oasis_eval", "epa"}]
-    evaluation_rows += [dict(r) for r in exclusions if r["exclude"]]
-    if len(set(LEGACY_EVAL_COLUMNS)) != 30:
-        raise NumberingError("The original evaluation column contract was changed unexpectedly.")
+    evaluation_rows += [dict(r) for r in exclusions if r["exclude"] or r["reason"]]
+    if len(set(LEGACY_EVAL_COLUMNS)) != 31 or LEGACY_EVAL_COLUMNS[-2:] != ["exclude", "reason"]:
+        raise NumberingError("The evaluation export must retain its original 30 columns plus reason.")
     files = {
         LEGACY_EVAL_FILENAME: csv_bytes(evaluation_rows, LEGACY_EVAL_COLUMNS),
         "redcap_checklist_entries.csv": csv_bytes([r for r in rendered if r["redcap_repeat_instrument"] == "checklist_entry"], CHECKLIST_EXPORT_COLUMNS),
         "redcap_preceptor_matching.csv": csv_bytes([r for r in rendered if r["redcap_repeat_instrument"] == "preceptor_matching"], MATCH_EXPORT_COLUMNS),
-        "redcap_exclusion_updates.csv": csv_bytes(exclusions, ["record_id", "exclude"]),
+        "redcap_exclusion_updates.csv": csv_bytes(exclusions, ["record_id", "exclude", "reason"]),
     }
     summary_columns = ["record_id", "start_date", "end_date", "name", "email"]
     summary_keys = ["cas_submissions", "scorable_evaluations", "manual_exclusions", "unscorable_submissions", "score_before_drop", "clinical_score_375", *(k + "_mean_after_drop" for k in DOMAIN_KEYS), "dropped_evaluator", "dropped_form_record", "professionalism_review", "individual_domain_below_3", "domain_mean_below_3"]
@@ -1802,11 +1902,17 @@ def plan_legacy_exports(run: Run, registry: dict) -> dict:
 REDCAP_HELP = """ORIGINAL REDCAP EVALUATION LAYOUT
 
 MAIN FILE
-redcap_oasis_eval_clerk_upload.csv has exactly the same 30 column names/order as
-the owner's reference redcap_oasis_eval_clerk_upload(20261012-234134).csv.
+redcap_oasis_eval_clerk_upload.csv retains the original 30 columns in their original
+order and appends one new column: reason (31 columns total).
 Student External ID is record_id. Clinical assessments repeat in oasis_eval.
 Observed H&P AND handoff assessments repeat in epa, sharing that instrument's
-number sequence for each student. The parent exclude field is a separate row.
+number sequence for each student. The parent exclude and reason fields share a
+separate non-repeating row under the student's actual record_id. reason contains
+Student, Preceptor, Form and Reason for each active rule applied to this run.
+Multiple rules are separated by a blank line inside the same CSV cell. Inactive,
+removed and nonmatching rules are not included; the automatic drop stays in exclude.
+Add a Notes Box field named reason to a NON-repeating instrument in REDCap. Do
+not put it on oasis_eval or epa. No data dictionary replacement is needed.
 Raw N/A domain scores stay blank; iv contains the mean-imputation value, and
 tot is the per-evaluation score out of 375. Source timestamps remain in the audit;
 the import dates follow the reference's MM-DD-YYYY 23:59 format.
@@ -1816,14 +1922,17 @@ Use a classic project with oasis_eval and epa configured as repeating instrument
 Do not import into the previous flat-record project without rebuilding its schema.
 Use REDCap's Data Import Tool; preserve supplied record IDs, choose the M-D-Y date
 format where requested, and review the comparison table. For the mixed original
-30-column CSV, keep Overwrite with blank values = NO unless you have verified
+31-column CSV, keep Overwrite with blank values = NO unless you have verified
 exactly how blank clearing affects each form in your project.
 
 CONTROLLED CLEARING / CORRECTIONS
-redcap_exclusion_updates.csv contains only record_id and exclude, including blank
-exclude values for students who no longer have an automatic drop. Import this
-separately with blank overwriting enabled when updating/clearing the app-managed
-exclude field. Never clear manual director notes stored there without reviewing.
+redcap_exclusion_updates.csv contains only record_id, exclude and reason, including
+blank exclude values when no automatic drop applies and blank reason values when
+no manual rule applies to the current source. After removing the last applicable
+rule, import this companion separately with blank overwriting enabled to clear the
+old REDCap reason. It does not include scores, narratives or other fields. Review
+both managed fields before importing; do not clear manual director notes saved in
+them. A download does not change REDCap; changes occur only on confirmed import.
 To replace changed scores or clear a domain back to N/A, use the form-specific
 redcap_clinical_form_updates.csv or redcap_epa_form_updates.csv (only that form's
 fields) and review before allowing blanks to overwrite. These are full source
@@ -1860,7 +1969,14 @@ Manually excluded clinical evaluations are omitted from the primary import, as
 in the owner's original Python script. They remain in the audit and still count
 as received for reminder suppression. Auto-dropped evaluations stay in the file;
 the parent exclude text identifies the drop. Omitting a row never deletes an
-already imported REDCap entry. Full current source exports are needed for scores.
+already imported REDCap entry. Remove selected exclusions deletes rules from the
+app list, not source assessments or existing REDCap records. Other overlapping
+active rules may still exclude a submission; the app warns about this. Rebuild
+with Create files after changes; a restored assessment can still be the automatic
+lowest-score drop. Save evaluation exclusions to retain edits and removals in a
+separate encrypted GitHub file. Wait for the green SAVED confirmation before
+closing; a JSON backup remains an optional recovery copy.
+Full current source exports are needed for scores.
 The download includes the selected rotation(s), not all historic student records.
 The number registry preserves older numbers, not older grades or narratives.
 Importing CSVs does not delete source items missing from a later run.
@@ -1924,24 +2040,63 @@ def authenticate(st: Any) -> bool:
     return False
 
 
-def director_controls(st: Any, oasis_blob: bytes | None) -> None:
-    """Optional controls, without APIs, database exports or automatic network writes."""
-    with st.expander("Exclusions", expanded=False):
-        st.caption("The three original student–preceptor exclusions load automatically. Rules affect clinical scoring, not received-evaluation counts or reminders.")
+def director_controls(st: Any, oasis_blob: bytes | None, evaluation_state: dict | None = None) -> None:
+    """Grading-rule edits are explicit encrypted saves, not session-only changes."""
+    if evaluation_state is None:
+        evaluation_state = evaluation_archive_state(st)
+        sync_evaluation_rules(st, evaluation_state)
+    with st.expander("Evaluation exclusions — save for future visits", expanded=False):
+        st.caption("These rules affect clinical scoring, not received-evaluation counts or reminders. "
+                   "Saved rules load automatically on future visits, even without source files. "
+                   "Faculty reminder exclusions remain separate.")
+        feedback = st.session_state.pop("evaluation_rules_feedback", "")
+        if feedback:
+            st.success(feedback)
+        can_save = evaluation_state.get("archive") is not None and not evaluation_state.get("error")
         rules = normalize_rules(st.session_state["rules"])
         editable = [{"rule_id": r["rule_id"], "active": r["active"], "student": r["student_name"] or r["record_id"],
                      "preceptor": r["evaluator"] or r["evaluator_email"], "form": r["form_record"] or "All for this pair",
                      "reason": r["reason"]} for r in rules]
         if editable:
             edited = st.data_editor(editable, hide_index=True, num_rows="fixed", key="rule_editor_" + digest(rules)[:12],
-                                    disabled=["rule_id", "student", "preceptor", "form"], width="stretch")
-            if st.button("Apply exclusion changes", key="apply_rules"):
-                if hasattr(edited, "to_dict"):
-                    edited = edited.to_dict("records")
-                updates = {r["rule_id"]: r for r in edited}
-                st.session_state["rules"] = normalize_rules([{**r, "active": updates[r["rule_id"]]["active"], "reason": updates[r["rule_id"]]["reason"]} for r in rules])
+                                    disabled=["rule_id", "student", "preceptor", "form"], width="stretch",
+                                    column_config={"rule_id": None, "active": "Active", "student": "Student",
+                                                   "preceptor": "Preceptor", "form": "Form / scope", "reason": "Reason"})
+            if hasattr(edited, "to_dict"):
+                edited = edited.to_dict("records")
+            updates = {r["rule_id"]: r for r in edited}
+            staged = normalize_rules([{**r, "active": updates[r["rule_id"]]["active"],
+                                       "reason": updates[r["rule_id"]]["reason"]} for r in rules])
+            if staged != rules:
+                # Table edits become a visible draft; nothing is written until Save.
+                st.session_state["rules"] = rules = staged
+                st.session_state["evaluation_draft_pending"] = True
                 st.session_state.pop("result", None)
-                st.rerun()
+                st.session_state.pop("evaluation_rules_feedback", None)
+        else:
+            st.info("No evaluation exclusions are configured. All received assessments remain eligible for the existing grading rules.")
+        render_evaluation_save_status(st, evaluation_state)
+        if st.button("Save evaluation exclusions", key="apply_rules", type="primary", width="stretch", disabled=not can_save):
+            save_evaluation_rule_action(st, evaluation_state, rules)
+            st.rerun()
+        st.caption("After editing Active or Reason, click Save evaluation exclusions. Adding or removing below also saves immediately. "
+                   "Wait for the green SAVED confirmation, then click Create files again for updated scores and REDCap reasons.")
+        if rules:
+            by_id = {r["rule_id"]: r for r in rules}
+            removals = st.multiselect("Evaluation exclusions to remove", list(by_id),
+                                      format_func=lambda k: evaluation_exclusion_label(by_id[k]),
+                                      key="evaluation_rules_remove_" + digest(rules)[:12])
+            overlaps = overlapping_exclusions_after_removal(rules, removals)
+            if overlaps:
+                st.warning("Another active exclusion still overlaps the selected rule(s). To restore those evaluations, also remove or deactivate the overlapping rule(s): "
+                           + " ; ".join(evaluation_exclusion_label(r) for r in overlaps))
+            if st.button("Remove selected exclusions and save", key="remove_evaluation_rules", disabled=not removals or not can_save):
+                try:
+                    desired = remove_evaluation_exclusions(rules, removals)
+                    save_evaluation_rule_action(st, evaluation_state, desired)
+                    st.rerun()
+                except ValueError as exc:
+                    st.error(str(exc))
         if oasis_blob:
             try:
                 picks = exclusion_choices(read_csv_bytes(oasis_blob, "OASIS ME", Messages()))
@@ -1951,30 +2106,42 @@ def director_controls(st: Any, oasis_blob: bytes | None) -> None:
                     pk = st.selectbox("Preceptor", list(preceptors), format_func=lambda k: display_name(preceptors[k]["evaluator"]), key="rule_preceptor_" + rid)
                     preceptor = preceptors[pk]
                     fk = st.selectbox("Exclude", ["all"] + list(preceptor["forms"]),
-                                      format_func=lambda k: "All clinical evaluations for this student–preceptor pair" if k == "all" else f"Form {preceptor['forms'][k]['form_record'] or 'no ID'} — {preceptor['forms'][k]['submit_date']}", key="rule_form_" + pk)
+                                      format_func=lambda k: "All clinical evaluations for this student–preceptor pair" if k == "all" else f"Form {preceptor['forms'][k]['form_record'] or 'no ID'} — {preceptor['forms'][k]['submit_date']}", key="rule_form_" + rid + "_" + pk)
                     reason = st.text_input("Reason for this exclusion", key="rule_reason")
-                    if st.button("Add exclusion", key="add_rule"):
+                    if st.button("Add exclusion and save", key="add_rule", disabled=not can_save):
                         if not reason.strip():
                             st.error("Enter the reason for the exclusion.")
                         else:
                             scope = {} if fk == "all" else preceptor["forms"][fk]
                             added = {"record_id": rid, "student_name": picks[rid]["name"], "evaluator": preceptor["evaluator"],
                                      "evaluator_email": preceptor["email"], "reason": reason, "active": True, "origin": "Director", **scope}
-                            st.session_state["rules"] = merge_rule_updates(rules, [added])
-                            st.session_state.pop("result", None)
+                            save_evaluation_rule_action(st, evaluation_state, merge_rule_updates(rules, [added]))
                             st.rerun()
             except ValueError as exc:
                 st.warning(str(exc))
+        # Restoring is intentionally a reviewable draft, not a silent archive replacement.
         backup = st.file_uploader("Restore saved exclusions (optional JSON)", type=["json"], key="restore_rules")
-        if st.button("Restore exclusions", disabled=backup is None, key="restore_rules_button"):
+        if st.button("Restore backup for review", disabled=backup is None, key="restore_rules_button"):
             try:
                 st.session_state["rules"] = normalize_rules(json.loads(backup.getvalue().decode("utf-8-sig")))
+                st.session_state["evaluation_draft_pending"] = True
                 st.session_state.pop("result", None)
+                st.session_state.pop("evaluation_save_error", None)
                 st.rerun()
             except (ValueError, UnicodeError) as exc:
                 st.error("Could not read the backup: " + str(exc))
         st.download_button("Download exclusions backup", exclusion_backup(st.session_state["rules"]), "exclusions_backup.json", "application/json", on_click="ignore")
-        st.caption("Changes last for this browser session. Download the backup after a change, then restore it next time. The owner can set EXCLUSIONS_JSON in Streamlit Secrets to make that rule set the startup default. REDCap imports also retain the rules used, but this app does not read REDCap.")
+        st.caption("Backup includes the current list, including any unsaved edits. Restore an older backup here once, review it, "
+                   "then click Save evaluation exclusions. Routine saved changes no longer require restoring a backup each visit. "
+                   "The REDCap reason field is an export, not the app's storage.")
+        if st.button("Refresh saved evaluation list", key="evaluation_refresh"):
+            st.rerun()  # sync_evaluation_rules preserves local unsaved changes.
+        base = st.session_state.get("evaluation_saved_base")
+        if evaluation_state["saved"].exists and st.session_state["rules"] != evaluation_state["saved"].rules:
+            discard = st.checkbox("Discard my unsaved edits and load the saved GitHub list.", key="evaluation_confirm_discard")
+            if st.button("Discard unsaved edits and reload", key="evaluation_discard", disabled=not discard or not evaluation_state.get("ready")):
+                accept_saved_evaluation_rules(st, evaluation_state["saved"])
+                st.rerun()
     with st.expander("Dates, requirements and reminder links", expanded=False):
         current = st.session_state["options"]
         with st.form("options_form"):
@@ -2030,7 +2197,7 @@ class ReminderArchiveConfig:
         token, encryption_key = text(raw.get("github_token")), text(raw.get("encryption_key"))
         branch = text(raw.get("branch")) or "main"
         if not re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_.-]+", repo) or repo.split("/")[-1] in {".", ".."}:
-            raise ReminderArchiveError("Set reminder_archive.repo to the private GitHub owner/repository name, not a URL.")
+            raise ReminderArchiveError("Set reminder_archive.repo to the GitHub owner/repository name, not a URL.")
         if not token or not encryption_key or any(v.startswith(("PASTE_", "YOUR_", "CHANGE_ME")) for v in (token, encryption_key)):
             raise ReminderArchiveError("Add the GitHub token and a generated encryption key to [reminder_archive] in Secrets.")
         if len(branch) > 200 or any(ord(c) < 32 for c in branch):
@@ -2364,6 +2531,301 @@ def render_faculty_reminder_controls(st: Any, result: dict | None, state: dict) 
         st.caption("Restore removes a name from the active list; older encrypted versions remain in GitHub history. Download new CSVs after changes—files already downloaded or emailed cannot be recalled.")
 
 
+# Grading exclusions use their OWN file; never reuse faculty names or number storage.
+EVALUATION_ARCHIVE_PATH = "private_config/evaluation_exclusions.json.enc"
+EVALUATION_ARCHIVE_PURPOSE = "pediatric-clerkship-evaluation-exclusions"
+
+
+class EvaluationArchiveError(ReminderArchiveError):
+    """A grading save/load is not confirmed. Never replace errors with defaults."""
+
+
+@dataclass
+class SavedEvaluationRules:
+    rules: list[dict] = field(default_factory=list)
+    sha: str = ""
+    exists: bool = False
+    saved_at: str = ""
+
+
+def _evaluation_payload(rules: Any, saved_at: str) -> dict:
+    if not isinstance(rules, list) or len(rules) > 2000:
+        raise EvaluationArchiveError("Invalid evaluation exclusion list or more than 2,000 rules; nothing was replaced.")
+    try:
+        cleaned = normalize_rules(rules)
+        when = datetime.fromisoformat(saved_at.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        raise EvaluationArchiveError("Evaluation exclusions or their saved timestamp are invalid; nothing was replaced.") from None
+    payload = {"version": 1, "purpose": EVALUATION_ARCHIVE_PURPOSE,
+               "saved_at": saved_at, "rules": cleaned}
+    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 550_000:
+        raise EvaluationArchiveError("The evaluation exclusion archive is too large; shorten reasons before saving.")
+    return payload
+
+
+def encrypt_evaluation_rules(rules: list[dict], encryption_key: str, saved_at: str) -> bytes:
+    payload = _evaluation_payload(rules, saved_at)
+    return reminder_cipher(encryption_key).encrypt(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def decrypt_evaluation_rules(ciphertext: bytes, encryption_key: str) -> dict:
+    from cryptography.fernet import InvalidToken
+    if not isinstance(ciphertext, bytes) or not ciphertext or len(ciphertext) > 900_000:
+        raise EvaluationArchiveError("The encrypted evaluation file is empty or invalid. It was not replaced with defaults.")
+    try:
+        payload = json.loads(reminder_cipher(encryption_key).decrypt(ciphertext).decode("utf-8"))
+    except (InvalidToken, UnicodeError, ValueError, TypeError):
+        raise EvaluationArchiveError("Saved evaluation exclusions could not be decrypted. Check the original key; nothing was reset.") from None
+    if (not isinstance(payload, dict) or type(payload.get("version")) is not int or payload["version"] != 1
+            or payload.get("purpose") != EVALUATION_ARCHIVE_PURPOSE or "rules" not in payload):
+        raise EvaluationArchiveError("This file is not a supported evaluation exclusion archive. Nothing was reset.")
+    return _evaluation_payload(payload["rules"], payload.get("saved_at", ""))
+
+
+def merge_evaluation_save(base: list[dict], desired: list[dict], current: list[dict]) -> list[dict]:
+    """Apply this session's changes only; conflict rather than lose same-rule edits.
+
+    Rules absent from the current upload are preserved. Deletions are intentional
+    changes, including deletion of the final rule. No legacy defaults are merged.
+    """
+    before = {r["rule_id"]: r for r in normalize_rules(base)}
+    wanted = {r["rule_id"]: r for r in normalize_rules(desired)}
+    remote = {r["rule_id"]: r for r in normalize_rules(current)}
+    changed = {k for k in before.keys() | wanted.keys() if before.get(k) != wanted.get(k)}
+    for k in changed:
+        if remote.get(k) != before.get(k) and remote.get(k) != wanted.get(k):
+            raise EvaluationArchiveError("Another session changed the same evaluation exclusion. Your edits are NOT SAVED. "
+                                         "Download a backup of your edits, reload the saved list, and reapply the intended change.")
+    for k in changed:
+        if k in wanted:
+            remote[k] = wanted[k]
+        else:
+            remote.pop(k, None)
+    return normalize_rules(list(remote.values()))
+
+
+class GitHubEvaluationArchive(GitHubReminderArchive):
+    """Durable encrypted grading rules, separate from the two other archives.
+
+    Fresh reads and SHA-conditional PUTs protect concurrent users. A successful
+    PUT alone is not enough: rules are re-read and decrypted before confirming.
+    """
+    def __init__(self, config: ReminderArchiveConfig, transport: Any = None):
+        super().__init__(config, transport)
+        self.file_url = self.repo_url + "/contents/" + EVALUATION_ARCHIVE_PATH
+
+    def _request(self, method: str, url: str, **kwargs: Any) -> Any:
+        try:
+            return super()._request(method, url, **kwargs)
+        except ReminderArchiveError:
+            raise EvaluationArchiveError("GitHub could not be reached. Evaluation exclusions were NOT confirmed saved. "
+                                         "Your current edits remain in this session; download a backup before leaving.") from None
+
+    def load_rules(self) -> SavedEvaluationRules:
+        repo = self._request("GET", self.repo_url)
+        self._check(repo)
+        obj = self._json(repo)
+        if not isinstance(obj, dict) or not obj.get("full_name"):
+            raise EvaluationArchiveError("Invalid GitHub repository response; evaluation exclusions were not reset.")
+        branch = self._request("GET", self.repo_url + "/branches/" + quote(self.config.branch, safe=""))
+        self._check(branch)
+        response = self._request("GET", self.file_url, params={"ref": self.config.branch})
+        if response.status_code == 404:
+            return SavedEvaluationRules()  # first save must be explicit; reads never write
+        self._check(response)
+        obj = self._json(response)
+        if (not isinstance(obj, dict) or obj.get("type") != "file" or obj.get("encoding") != "base64"
+                or not isinstance(obj.get("sha"), str) or not re.fullmatch(r"[a-fA-F0-9]{40,64}", obj["sha"])
+                or not isinstance(obj.get("content"), str) or len(obj["content"]) > 1_300_000):
+            raise EvaluationArchiveError("The saved evaluation file has an unexpected format. Nothing was reset.")
+        try:
+            ciphertext = base64.b64decode(re.sub(r"\s+", "", obj["content"]), validate=True)
+        except (ValueError, TypeError):
+            raise EvaluationArchiveError("The saved evaluation file is damaged. Nothing was reset.") from None
+        payload = decrypt_evaluation_rules(ciphertext, self.config.encryption_key)
+        return SavedEvaluationRules(payload["rules"], obj["sha"], True, payload["saved_at"])
+
+    def save_rules(self, desired: list[dict], base: SavedEvaluationRules) -> SavedEvaluationRules:
+        desired = normalize_rules(desired)
+        changed = {r["rule_id"] for r in desired + base.rules}
+        before = {r["rule_id"]: r for r in base.rules}
+        wanted = {r["rule_id"]: r for r in desired}
+        changed = {k for k in changed if before.get(k) != wanted.get(k)}
+        for _ in range(3):
+            current = self.load_rules()
+            if base.exists and not current.exists:
+                raise EvaluationArchiveError("The previously saved evaluation archive is missing. Restore it instead of starting over; no replacement was created.")
+            if not base.exists and current.exists:
+                # First-save race: do not silently restore defaults over an existing list.
+                if current.rules == desired:
+                    return current
+                raise EvaluationArchiveError("An evaluation archive was created by another session. Download your draft backup and reload the saved list before saving.")
+            merged = merge_evaluation_save(base.rules, desired, current.rules) if base.exists else desired
+            if current.exists and current.rules == merged:
+                return current  # fresh verified no-op, without a redundant commit
+            saved_at = datetime.now(ZoneInfo("UTC")).isoformat(timespec="seconds")
+            ciphertext = encrypt_evaluation_rules(merged, self.config.encryption_key, saved_at)
+            body = {"message": "Update encrypted evaluation exclusion settings", "branch": self.config.branch,
+                    "content": base64.b64encode(ciphertext).decode("ascii")}
+            if current.exists:
+                body["sha"] = current.sha
+            response = self._request("PUT", self.file_url, json=body)
+            if response.status_code in (409, 422):
+                continue
+            self._check(response, (200, 201))
+            verified = self.load_rules()
+            final = {r["rule_id"]: r for r in verified.rules}
+            # On first save verify the complete list; later verify each intended edit.
+            if (not verified.exists or (not base.exists and verified.rules != merged)
+                    or (base.exists and any(final.get(k) != wanted.get(k) for k in changed))):
+                raise EvaluationArchiveError("The saved evaluation list changed before verification. Save is NOT confirmed; reload and review your edits.")
+            return verified
+        raise EvaluationArchiveError("GitHub did not accept the evaluation save after three attempts. No save was confirmed. "
+                                     "Check branch protection or concurrent changes, keep your backup, and retry.")
+
+
+def evaluation_archive_state(st: Any) -> dict:
+    state = {"configured": False, "ready": False, "archive": None, "saved": SavedEvaluationRules(),
+             "error": "", "config_id": ""}
+    try:
+        raw = st.secrets.get("reminder_archive", None)
+    except (FileNotFoundError, KeyError):
+        raw = None
+    if raw is None:
+        state["error"] = "Evaluation saving is not connected. Configure the existing [reminder_archive] GitHub settings in Streamlit Secrets."
+        return state
+    state["configured"] = True
+    try:
+        cfg = ReminderArchiveConfig.from_mapping(raw)
+        state["config_id"] = digest([cfg.repo, cfg.branch, cfg.encryption_key])
+        state["archive"] = GitHubEvaluationArchive(cfg)
+        state["saved"] = state["archive"].load_rules()
+        state["ready"] = state["saved"].exists
+    except ReminderArchiveError as exc:
+        state["error"] = str(exc)
+    return state
+
+
+def accept_saved_evaluation_rules(st: Any, saved: SavedEvaluationRules) -> None:
+    st.session_state["rules"] = normalize_rules(saved.rules)
+    st.session_state["evaluation_saved_base"] = SavedEvaluationRules(normalize_rules(saved.rules), saved.sha, saved.exists, saved.saved_at)
+    st.session_state.pop("evaluation_save_error", None)
+    st.session_state.pop("evaluation_draft_pending", None)
+    st.session_state.pop("evaluation_rules_unloaded", None)
+    st.session_state.pop("result", None)
+
+
+def sync_evaluation_rules(st: Any, state: dict) -> None:
+    """Load before source uploads; a saved [] is authoritative, not 'missing'.
+
+    Old EXCLUSIONS_JSON/defaults seed only a never-initialized list. Unsaved edits
+    survive reruns and failed saves, but cannot masquerade as durable storage.
+    """
+    saved = state["saved"]
+    previous_config = st.session_state.get("evaluation_config_id", "")
+    if previous_config and state.get("config_id") and previous_config != state["config_id"]:
+        state["error"], state["ready"] = ("The archive repository, branch or encryption key changed during this session. "
+            "Download your exclusions backup, sign out, and reopen the app before using the new archive."), False
+        return
+    if state.get("config_id"):
+        st.session_state["evaluation_config_id"] = state["config_id"]
+    if "rules" not in st.session_state:
+        if saved.exists and not state["error"]:
+            accept_saved_evaluation_rules(st, saved)
+            return
+        # Do not substitute original exclusions after a configured archive read failure.
+        if state["configured"] and state["error"]:
+            st.session_state["rules"] = []
+            st.session_state["evaluation_rules_unloaded"] = True
+        else:
+            configured = app_secret(st, "EXCLUSIONS_JSON")
+            st.session_state["rules"] = normalize_rules(json.loads(configured) if configured else LEGACY_EXCLUSIONS)
+        st.session_state["evaluation_saved_base"] = SavedEvaluationRules()
+    elif "evaluation_saved_base" not in st.session_state:
+        # Preserve a live pre-upgrade browser's full draft for the first explicit save.
+        st.session_state["rules"] = normalize_rules(st.session_state["rules"])
+        st.session_state["evaluation_saved_base"] = saved if saved.exists else SavedEvaluationRules()
+    base = st.session_state["evaluation_saved_base"]
+    if not isinstance(base, SavedEvaluationRules):
+        state["error"], state["ready"] = "The evaluation save state needs a reload. Back up your current rules, sign out, and reopen.", False
+        return
+    if state["error"]:
+        return
+    if base.exists and not saved.exists:
+        state["error"], state["ready"] = "The previously saved evaluation archive is missing. Restore its encrypted file; it was not reset.", False
+        return
+    was_unloaded = st.session_state.pop("evaluation_rules_unloaded", False)
+    pending = st.session_state.get("evaluation_draft_pending", False)
+    if saved.exists:
+        local = normalize_rules(st.session_state["rules"])
+        if was_unloaded and pending:
+            # A backup was explicitly restored during the outage. Keep that draft,
+            # establish the actual remote baseline, and require Save after review.
+            st.session_state["evaluation_saved_base"] = saved
+        elif local == saved.rules or (local == base.rules and not pending) or (was_unloaded and not pending):
+            if local != saved.rules or base.sha != saved.sha:
+                accept_saved_evaluation_rules(st, saved)
+    elif was_unloaded and not pending:
+        configured = app_secret(st, "EXCLUSIONS_JSON")
+        st.session_state["rules"] = normalize_rules(json.loads(configured) if configured else LEGACY_EXCLUSIONS)
+
+
+def evaluation_rules_saved(st: Any, state: dict) -> bool:
+    return bool(not state.get("error") and state.get("ready") and state["saved"].exists
+                and normalize_rules(st.session_state.get("rules", [])) == state["saved"].rules
+                and not st.session_state.get("evaluation_save_error"))
+
+
+def saved_evaluation_time(value: str) -> str:
+    if not value:
+        return "unknown time"
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).strftime("%b %d, %Y at %I:%M:%S %p %Z")
+
+
+def render_evaluation_save_status(st: Any, state: dict) -> None:
+    error = st.session_state.get("evaluation_save_error") or state.get("error")
+    if error:
+        st.error("EVALUATION EXCLUSIONS — NOT SAVED / NOT VERIFIED. " + error)
+        st.caption("Your current list is kept only in this session until saving succeeds. Download a backup before closing the app. "
+                   "Scores and REDCap downloads are paused; reminder files are not changed by this check.")
+    elif evaluation_rules_saved(st, state):
+        saved = state["saved"]
+        count = sum(r["active"] for r in saved.rules)
+        st.success(f"EVALUATION EXCLUSIONS — SAVED. {count} active / {len(saved.rules)} total rule(s). "
+                   f"Saved {saved_evaluation_time(saved.saved_at)}. Loaded from encrypted GitHub storage and available on future visits.")
+    elif state["saved"].exists:
+        st.warning("EVALUATION EXCLUSIONS — UNSAVED CHANGES. Click Save evaluation exclusions under Show director tools. "
+                   "Current edits will not be remembered until the green SAVED confirmation appears.")
+    else:
+        st.warning("EVALUATION EXCLUSIONS — NOT SAVED YET. Review the list under Show director tools, restore your previous backup if needed, "
+                   "then click Save evaluation exclusions once. This creates a separate encrypted file for future visits.")
+
+
+def save_evaluation_rule_action(st: Any, state: dict, desired: list[dict]) -> bool:
+    """Preserve drafts on failure; report success only after encrypted readback."""
+    desired = normalize_rules(desired)
+    st.session_state["rules"] = desired
+    st.session_state["evaluation_draft_pending"] = True
+    st.session_state.pop("result", None)
+    st.session_state.pop("evaluation_rules_feedback", None)
+    try:
+        if state.get("error") or state.get("archive") is None:
+            raise EvaluationArchiveError(state.get("error") or "Encrypted evaluation saving is not configured.")
+        base = st.session_state.get("evaluation_saved_base", state["saved"])
+        verified = state["archive"].save_rules(desired, base)
+        accept_saved_evaluation_rules(st, verified)
+        state.update(saved=verified, ready=True, error="")
+        st.session_state["evaluation_rules_feedback"] = (
+            "SAVED to encrypted GitHub storage and verified. These evaluation exclusions will load on future visits. "
+            "Click Create files again to update scores and the REDCap reason column.")
+        return True
+    except ReminderArchiveError as exc:
+        st.session_state["evaluation_save_error"] = str(exc)
+        return False
+
+
 # Separate encrypted configuration from the faculty reminder suppression list.
 @dataclass
 class SavedNumberRegistry:
@@ -2516,7 +2978,10 @@ def attach_legacy_plan(result: dict, plan: dict) -> None:
                   registry=plan["registry"], manual_omitted=plan["manual_omitted"])
 
 
-def render_downloads(st: Any, result: dict, reminder_state: dict | None = None) -> None:
+def render_downloads(st: Any, result: dict, reminder_state: dict | None = None, *, evaluation_ready: bool = True) -> None:
+    if not evaluation_ready:
+        result = {**result, "redcap": b"", "redcap_files": {}, "redcap_error":
+                  "Evaluation exclusions are not saved and verified. Open Show director tools, save them, then click Create files."}
     run, reports = result["run"], result["reports"]
     reminder_state = reminder_state or {"ready": False, "saved": SavedReminderNames(), "error": "Saved reminder exclusions have not been loaded."}
     archive_ready = bool(reminder_state["ready"])
@@ -2557,11 +3022,12 @@ def render_downloads(st: Any, result: dict, reminder_state: dict | None = None) 
     st.divider()
     st.download_button("Download original-layout evaluation import", result["redcap"] or b"", LEGACY_EVAL_FILENAME, "text/csv", disabled=not bool(result["redcap"]), on_click="ignore", width="stretch", key="download_redcap")
     if result["redcap"]:
-        st.caption(f"{result['redcap_count']} rows with your original 30 columns: clinical assessments, observed H&Ps, handoffs and automatic-drop summaries. Original student IDs and saved repeat numbers are preserved.")
+        st.caption(f"{result['redcap_count']} rows with your original 30 columns plus reason. Each student's active evaluation-exclusion details share one non-repeating row with their automatic-drop summary. Original student IDs and saved repeat numbers are preserved.")
+        st.info("REDCap needs a Notes Box field named reason on a NON-repeating instrument. It contains student, preceptor, form and reason. Do not create it on the repeating oasis_eval or epa instrument.")
         with st.expander("Additional REDCap imports — checklists, matching and score summaries", expanded=False):
             for filename in ("redcap_checklist_entries.csv", "redcap_preceptor_matching.csv", "redcap_clinical_summary.csv", "redcap_exclusion_updates.csv", "redcap_clinical_form_updates.csv", "redcap_epa_form_updates.csv"):
                 st.download_button(filename, result["redcap_files"][filename], filename, "text/csv", on_click="ignore", key="extra_" + filename)
-            st.caption("The exclusion-update file can clear an outdated parent exclude value. The form-specific update files can clear corrected N/A scores. Review the import instructions before enabling blank overwriting.")
+            st.caption("After removing the last applicable evaluation exclusion, use redcap_exclusion_updates.csv to clear any old reason already in REDCap. That file contains only record_id, exclude and reason; review it before importing with blank overwriting enabled. Keep blank overwriting OFF for the mixed main export. Form-specific updates can clear corrected N/A scores.")
             st.download_button("Download all REDCap import files", zipped(result["redcap_files"]), "redcap_import_files.zip", "application/zip", on_click="ignore")
         for warning in result.get("redcap_warnings", []):
             st.warning(warning)
@@ -2577,7 +3043,7 @@ def render_downloads(st: Any, result: dict, reminder_state: dict | None = None) 
         for name in REMINDER_NAMES:
             count = max(0, len(list(csv.reader(io.StringIO(reports[name].decode("utf-8-sig"))))) - 1)
             st.write(f"{name}: {count} reminder rows")
-    if st.session_state.get("show_director", False):
+    if st.session_state.get("show_director", False) and evaluation_ready:
         with st.expander("Scores and detailed outputs", expanded=False):
             st.dataframe(run.reports["scores"], hide_index=True, width="stretch")
             details = {**reports, "exclusions_backup.json": exclusion_backup(run.settings.exclusions)}
@@ -2596,13 +3062,12 @@ def main() -> None:
     st.title("Pediatric Clerkship Tracker")
     if not authenticate(st):
         st.stop()
-    if "rules" not in st.session_state:
-        try:
-            configured = app_secret(st, "EXCLUSIONS_JSON")
-            st.session_state["rules"] = normalize_rules(json.loads(configured) if configured else LEGACY_EXCLUSIONS)
-        except (ValueError, TypeError) as exc:
-            st.error("The owner needs to correct EXCLUSIONS_JSON in Secrets: " + str(exc))
-            st.stop()
+    evaluation_state = evaluation_archive_state(st)
+    try:
+        sync_evaluation_rules(st, evaluation_state)
+    except (ValueError, TypeError) as exc:
+        st.error("The owner needs to correct the initial EXCLUSIONS_JSON in Secrets or restore the encrypted evaluation archive: " + str(exc))
+        st.stop()
     st.session_state.setdefault("options", {})
     st.caption("Upload four CSV files, create your files, and download. Your original reminder layouts and REDCap evaluation layout are retained.")
     st.subheader("1. Upload your files")
@@ -2619,7 +3084,9 @@ def main() -> None:
         uploads.append(st.file_uploader(f"Upload {label} CSV", type=["csv"], key="source_" + str(i)))
     st.caption("Use complete exports for the same rotation. Keep the source student IDs and original OASIS Form Record column. The four mailing files use your original columns; clinical-evaluation and observed H&P reminders stay separate.")
     if st.checkbox("Show director tools", key="show_director"):
-        director_controls(st, uploads[3].getvalue() if uploads[3] else None)
+        director_controls(st, uploads[3].getvalue() if uploads[3] else None, evaluation_state)
+    render_evaluation_save_status(st, evaluation_state)
+    grading_ready = evaluation_rules_saved(st, evaluation_state)
     numbering_state = numbering_archive_state(st)
     st.subheader("2. Create and download")
     ready = all(f is not None for f in uploads)
@@ -2632,11 +3099,13 @@ def main() -> None:
         try:
             with st.spinner("Checking files and preparing downloads…"):
                 result = build_bundle(blobs, names, settings)
-                if not result["run"].messages.blocked and numbering_state["ready"]:
+                if not result["run"].messages.blocked and numbering_state["ready"] and grading_ready:
                     try:
                         attach_legacy_plan(result, numbering_state["archive"].prepare(result["run"]))
                     except (ReminderArchiveError, NumberingError) as exc:
                         result["redcap_error"] = str(exc)
+            if not grading_ready:
+                result["redcap_error"] = "Save and verify evaluation exclusions under Show director tools before preparing scores or REDCap downloads."
             st.session_state["result"] = {**result, "signature": signature}
         except (ValueError, UnicodeError, csv.Error) as exc:
             st.error(str(exc))
@@ -2648,10 +3117,16 @@ def main() -> None:
         if not ready or result["signature"] != signature:
             st.info("The files or settings changed. Click Create files again for updated downloads.")
         else:
-            render_downloads(st, result, reminder_state)
+            render_downloads(st, result, reminder_state, evaluation_ready=grading_ready)
     render_numbering_setup(st, numbering_state)
-    st.caption("No reminders are emailed and no student data is uploaded automatically. Explicit save actions store encrypted reminder preferences; after numbering setup, Create files also stores encrypted repeat-number reservations in GitHub. Neither action uploads grades or narratives. Clinical scores are out of 375, not final clerkship grades. Keep this app and its source code restricted to authorized users.")
-    if st.button("Clear files and sign out", key="signout"):
+    st.caption("No reminders are emailed and no student data is uploaded automatically. Explicit save actions store evaluation exclusions (including their reasons) and faculty reminder preferences in separate encrypted GitHub files; after numbering setup, Create files also stores encrypted repeat-number reservations. No source assessment narratives or clinical scores are uploaded to GitHub. Clinical scores are out of 375, not final clerkship grades. Keep this app and its source code restricted to authorized users.")
+    base = st.session_state.get("evaluation_saved_base", SavedEvaluationRules())
+    unsaved = normalize_rules(st.session_state.get("rules", [])) != base.rules or bool(st.session_state.get("evaluation_save_error"))
+    allow_exit = not unsaved
+    if unsaved:
+        st.warning("Evaluation exclusion edits have not been confirmed saved. Save them or download a backup before signing out.")
+        allow_exit = st.checkbox("I understand these unsaved evaluation edits will be lost when I sign out.", key="allow_unsaved_signout")
+    if st.button("Clear files and sign out", key="signout", disabled=not allow_exit):
         st.session_state.clear()
         st.rerun()
 
