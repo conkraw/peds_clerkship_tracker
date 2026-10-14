@@ -3141,7 +3141,7 @@ def render_numbering_setup(st: Any, state: dict) -> None:
             if choice == "Existing numbered REDCap project":
                 refs = st.file_uploader("Last imported evaluation CSV; include existing checklist/match imports too when applicable", type=["csv"], accept_multiple_files=True, key="legacy_numbering_refs") or []
                 st.caption("Use the original redcap_oasis_eval_clerk_upload CSV, NOT the newer flat redcap_import.csv. A saved file must reflect actual project numbering; a download alone is not proof of import.")
-            consent = st.checkbox("These files reflect the existing numbers; any unrepresented checklist/matching instruments are empty. Save encrypted numbering in GitHub and extend it when I click Create files.", key="legacy_numbering_consent")
+            consent = st.checkbox("These files reflect the existing numbers; any unrepresented checklist/matching instruments are empty. Save encrypted numbering in GitHub and extend it when I choose REDCap export.", key="legacy_numbering_consent")
             enabled = consent and choice != "Choose one" and (choice == "New empty repeating-form project" or bool(refs))
             if st.button("Save REDCap numbering setup", disabled=not enabled, key="initialize_numbering"):
                 try:
@@ -3155,13 +3155,13 @@ def render_numbering_setup(st: Any, state: dict) -> None:
                         raise NumberingError("The reference contains no supported repeating records; it was not treated as an empty project.")
                     state["archive"].initialize_numbers(registry)
                     st.session_state.pop("result", None)
-                    st.success("Numbering saved. Your original CSV was not uploaded to GitHub. Click Create files after this refresh.")
+                    st.success("Numbering saved. Your original CSV was not uploaded to GitHub. Choose REDCap export after this refresh.")
                     st.rerun()
                 except (ValueError, ReminderArchiveError, csv.Error) as exc:
                     st.error(str(exc))
         st.download_button("Download original-layout field reference", csv_bytes([], LEGACY_EVAL_COLUMNS), "redcap_oasis_eval_clerk_upload_TEMPLATE.csv", "text/csv", on_click="ignore")
         st.download_button("Download REDCap import instructions", REDCAP_HELP.encode(), "REDCAP_SETUP.txt", "text/plain", on_click="ignore")
-        st.caption("The primary CSV has your original 30 columns. Checklist entries, preceptor matches and clinical summary scores are separate companion files. Existing REDCap calculations are not replaced.")
+        st.caption("The primary CSV has your original 30 columns plus reason. Checklist entries, preceptor matches and clinical summary scores are separate companion files. Existing REDCap calculations are not replaced.")
 
 
 def attach_legacy_plan(result: dict, plan: dict) -> None:
@@ -3248,7 +3248,7 @@ def render_downloads(st: Any, result: dict, reminder_state: dict | None = None, 
             st.caption("Contains grades and narratives. Do not use this ZIP as a mailing-input folder.")
 
 
-def main() -> None:
+def legacy_main() -> None:
     import streamlit as st
     st.set_page_config(page_title="Pediatric Clerkship Tracker", page_icon="📋", layout="centered")
     st.title("Pediatric Clerkship Tracker")
@@ -3323,6 +3323,705 @@ def main() -> None:
     if st.button("Clear files and sign out", key="signout", disabled=not allow_exit):
         st.session_state.clear()
         st.rerun()
+
+
+
+# ---------------------------------------------------------------------------
+# Dashboard interface. This layer changes presentation only: calculations,
+# matching, CSV contracts, and the three encrypted stores are unchanged.
+# ---------------------------------------------------------------------------
+DASHBOARD_VERSION = "1.0"
+DASHBOARD_SOURCES = (
+    ("Rotation schedule", "https://redcap.ctsi.psu.edu/redcap_v17.3.9/DataExport/index.php?pid=19389&report_id=70188"),
+    ("Updated checklist", "https://oasis.pennstatehealth.net/admin/course/experience_requirement/view_distribution_setup.html"),
+    ("Preceptor match file", "https://oasis.pennstatehealth.net/admin/course/e_manage/manage_evaluators.html"),
+    ("OASIS ME evaluation export", "https://oasis.pennstatehealth.net/admin/course/e_manage/student_performance/setup_analysis_report.html"),
+)
+DASHBOARD_CSS = """
+<style>
+.block-container {max-width: 1580px; padding-top: 1.4rem; padding-bottom: 1.5rem;}
+.clerkship-head {display:flex; align-items:center; gap:14px; margin-bottom:12px;}
+.clerkship-mark {background:#183954; color:white; border-radius:14px; padding:12px 15px;
+  font-size:22px; font-weight:750; line-height:1;}
+.clerkship-head h1 {font-size:1.8rem; padding:0; margin:0; line-height:1.2;}
+.clerkship-head p {margin:4px 0 0; opacity:.7; font-size:.9rem;}
+.st-key-dashboard_uploads [data-testid="stVerticalBlockBorderWrapper"] {border-radius:12px;}
+.st-key-dashboard_uploads [data-testid="stFileUploaderDropzone"] {padding:8px; min-height:100px;}
+.st-key-dashboard_uploads [data-testid="stFileUploaderDropzoneInstructions"] {font-size:.78rem;}
+.st-key-dashboard_uploads [data-testid="stFileUploaderDropzoneInstructions"] small {font-size:.68rem;}
+.st-key-dashboard_actions button {min-height:44px; border-radius:10px; font-weight:650;}
+.st-key-dashboard_actions {margin:4px 0 8px;}
+.st-key-dashboard_actions button[kind="primary"] {background:#145b68; border-color:#145b68; color:white;}
+.st-key-dashboard_downloads [data-testid="stMetric"] {padding:0;}
+[data-testid="stAlert"] {border-radius:10px;}
+@media (max-width: 700px) {
+  .block-container {padding-left:1rem; padding-right:1rem;}
+  .clerkship-head h1 {font-size:1.45rem;}
+}
+</style>
+"""
+
+
+def dashboard_edit_open(st: Any) -> bool:
+    return bool(st.session_state.get("evaluation_edit_context") or st.session_state.get("dashboard_add_context"))
+
+
+def dashboard_grading_ready(st: Any, state: dict) -> bool:
+    return not dashboard_edit_open(st) and evaluation_rules_saved(st, state)
+
+
+def dashboard_selection(event: Any, count: int) -> list[int]:
+    """Read row selections without trusting indexes from an older table."""
+    selection = event.get("selection", {}) if isinstance(event, dict) else getattr(event, "selection", {})
+    rows = selection.get("rows", []) if isinstance(selection, dict) else getattr(selection, "rows", [])
+    return sorted({i for i in rows if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < count})
+
+
+def dashboard_table(st: Any, rows: list[dict], widget: str, *, single: bool = False, hidden: tuple = ()) -> list[int]:
+    if not rows:
+        return []
+    event = st.dataframe(rows, hide_index=True, width="stretch", height=min(285, 40 + 36 * len(rows)),
+                         on_select="rerun", selection_mode="single-row" if single else "multi-row",
+                         column_config={name: None for name in hidden},
+                         key=widget + "_" + digest(rows)[:12])
+    return dashboard_selection(event, len(rows))
+
+
+def dashboard_notice(st: Any, message: str, details: str = "", *, error: bool = False) -> None:
+    (st.error if error else st.warning)(message)
+    if details:
+        with st.expander("Details", expanded=False):
+            st.write(details)
+
+
+def dashboard_evaluation_status(st: Any, state: dict) -> None:
+    error = st.session_state.get("evaluation_save_error") or state.get("error")
+    if error:
+        dashboard_notice(st, "Not saved or verified. Scores and REDCap files are paused.", error, error=True)
+    elif dashboard_edit_open(st):
+        st.warning("Unsaved edit — choose Save or Cancel before leaving this screen.")
+    elif evaluation_rules_saved(st, state):
+        saved = state["saved"]
+        st.success(f"Saved · {sum(r['active'] for r in saved.rules)} active exclusions · {saved_evaluation_time(saved.saved_at)}")
+    else:
+        st.warning("This list is not saved yet. Choose Save list to remember it for future visits.")
+
+
+def dashboard_inputs(st: Any) -> list[Any]:
+    """Render all four widgets on every route so uploads survive navigation."""
+    uploads = []
+    with st.container(key="dashboard_uploads"):
+        columns = st.columns(4, gap="small")
+        for i, (label, url) in enumerate(DASHBOARD_SOURCES):
+            with columns[i]:
+                with st.container(border=True):
+                    short = ("Rotation schedule", "Checklist", "Preceptor matches", "OASIS evaluations")[i]
+                    st.markdown(f"**{i + 1} · {short}**")
+                    st.link_button("Open export website ↗", url, width="stretch")
+                    f = st.file_uploader("Upload " + label + " CSV", type=["csv"], key="source_" + str(i),
+                                         label_visibility="collapsed", disabled=dashboard_edit_open(st))
+                    uploads.append(f)
+    return uploads
+
+
+def dashboard_source_context(st: Any, uploads: list[Any]) -> tuple:
+    ready = all(f is not None for f in uploads)
+    blobs = [f.getvalue() for f in uploads] if ready else []
+    names = [f.name for f in uploads] if ready else ["", "", "", ""]
+    settings = settings_from_options(st.session_state["options"], names, st.session_state["rules"])
+    signature = digest([VERSION, [hashlib.sha256(b).hexdigest() for b in blobs], names, asdict(settings)])
+    return ready, blobs, names, settings, signature
+
+
+def dashboard_build(st: Any, blobs: list[bytes], names: list[str], settings: Settings, signature: str,
+                    evaluation_state: dict, numbering_state: dict, *, prepare_redcap: bool) -> dict | None:
+    """Only an explicit REDCap button reserves numbers. No REDCap API upload."""
+    if len(blobs) != 4 or dashboard_edit_open(st):
+        return None
+    st.session_state.pop("result", None)
+    try:
+        with st.spinner("Preparing your files…"):
+            result = build_bundle(blobs, names, settings)
+            if prepare_redcap and not result["run"].messages.blocked:
+                if not dashboard_grading_ready(st, evaluation_state):
+                    result["redcap_error"] = "Save evaluation exclusions first."
+                elif not numbering_state["ready"]:
+                    result["redcap_error"] = "Complete REDCap setup in Settings first."
+                else:
+                    try:
+                        attach_legacy_plan(result, numbering_state["archive"].prepare(result["run"]))
+                    except (ReminderArchiveError, NumberingError) as exc:
+                        result["redcap_error"] = str(exc)
+            result["signature"] = signature
+            st.session_state["result"] = result
+            return result
+    except (ValueError, UnicodeError, csv.Error) as exc:
+        st.error(str(exc))
+        return None
+
+
+def dashboard_filtered_reports(result: dict, reminder_state: dict) -> tuple[dict, dict, dict]:
+    reports = dict(result["reports"])
+    readiness = dict(daily_readiness(result["run"]))
+    removed = {n: 0 for n in FACULTY_REMINDER_FILES}
+    archive_ready = bool(reminder_state.get("ready"))
+    if archive_ready:
+        try:
+            reports, removed = apply_faculty_reminder_exclusions(reports, list(reminder_state["saved"].names))
+        except ReminderArchiveError:
+            archive_ready = False
+    if not archive_ready:
+        # Even disabled widgets must not contain an unfiltered mailing payload.
+        for name in FACULTY_REMINDER_FILES:
+            reports[name] = reminder_csv_bytes([], REMINDER_COLUMNS[name])
+            readiness[name] = False
+    if result["run"].messages.blocked:
+        readiness = {n: False for n in REMINDER_NAMES}
+    return reports, readiness, removed
+
+
+def dashboard_count(data: bytes) -> int:
+    return max(0, sum(1 for _ in csv.reader(io.StringIO(data.decode("utf-8-sig")))) - 1)
+
+
+def dashboard_checks(st: Any, result: dict, *, detailed: bool = False) -> bool:
+    messages = result["run"].messages.rows
+    errors = [m for m in messages if m["level"] == "ERROR"]
+    warnings = [m for m in messages if m["level"] == "WARNING"]
+    for msg in errors:
+        st.error(msg["detail"])
+    if warnings and not detailed:
+        st.warning(f"{len(warnings)} file-check notice(s). Open Review → File checks before sending.")
+    if detailed:
+        st.dataframe(result["run"].source_stats, hide_index=True, width="stretch")
+        if messages:
+            st.dataframe(messages, hide_index=True, width="stretch")
+        else:
+            st.success("No file-check notices.")
+        st.download_button("Download file checks", result["reports"]["validation_report.csv"],
+                           "validation_report.csv", "text/csv", on_click="ignore", key="dash_check_report")
+    elif errors:
+        st.download_button("Download file checks", result["reports"]["validation_report.csv"],
+                           "validation_report.csv", "text/csv", on_click="ignore", key="dash_error_report")
+    return not errors
+
+
+def dashboard_reminders(st: Any, result: dict | None, reminder_state: dict, ready: bool) -> None:
+    st.subheader("Reminder files")
+    if not result:
+        st.info("Choose Generate reminders above." if ready else "Add the four CSV files above to get started.")
+        return
+    if not dashboard_checks(st, result):
+        return
+    run = result["run"]
+    reports, readiness, removed = dashboard_filtered_reports(result, reminder_state)
+    st.caption(f"{len(run.roster)} students · Reminders: {run.settings.as_of} · OASIS data through {run.settings.data_through or run.settings.as_of}")
+    labels = ("Student checklist", "Student requests", "Clinical evaluations", "Observed H&Ps")
+    with st.container(key="dashboard_downloads"):
+        for col, name, label in zip(st.columns(4, gap="small"), REMINDER_NAMES, labels):
+            with col:
+                with st.container(border=True):
+                    st.markdown("**" + label + "**")
+                    st.metric("Rows", dashboard_count(reports[name]) if readiness[name] else "Paused")
+                    st.download_button("Download CSV", reports[name] if readiness[name] else b"", name, "text/csv",
+                                       key="download_" + name, disabled=not readiness[name], width="stretch",
+                                       help=name, on_click="ignore")
+    all_ready = all(readiness.values())
+    st.download_button("Download all four reminder files", zipped({n: reports[n] for n in REMINDER_NAMES}) if all_ready else b"",
+                       "power_automate_reminders.zip", "application/zip", disabled=not all_ready, width="stretch", on_click="ignore")
+    if not all(daily_readiness(run).values()):
+        st.warning("Some uploads cover different rotations. Affected downloads are paused.")
+    if not reminder_state.get("ready"):
+        st.warning("Faculty reminder list unavailable. Clinical and H&P reminders are paused; open Exclude faculty.")
+    if any(removed.values()):
+        st.caption(f"Saved faculty preferences removed {sum(removed.values())} reminder rows.")
+    st.caption("Your four original filenames and columns. The checklist file includes Complete and Needs review rows.")
+
+
+def dashboard_redcap(st: Any, result: dict | None, grading_ready: bool, numbering_state: dict, ready: bool) -> None:
+    st.subheader("REDCap import files")
+    if not grading_ready:
+        st.warning("Save evaluation exclusions before preparing REDCap files.")
+        return
+    if not numbering_state.get("ready"):
+        st.warning("REDCap setup needs attention. Open Settings → Storage & REDCap.")
+        return
+    if not result:
+        st.info("Choose REDCap export above to prepare your files." if ready else "Add the four CSV files above first.")
+        return
+    if not dashboard_checks(st, result):
+        return
+    if not result.get("redcap"):
+        dashboard_notice(st, "REDCap files are not ready. Choose REDCap export to rebuild.", result.get("redcap_error", ""))
+        return
+    st.caption("Download these CSVs, then import them in REDCap. This app does not upload them automatically.")
+    rows = result["redcap_count"]
+    st.download_button(f"Download evaluations + reasons · {rows} rows", result["redcap"], LEGACY_EVAL_FILENAME, "text/csv",
+                       key="download_redcap", type="primary", width="stretch", on_click="ignore")
+    companions = (("Checklist entries", "redcap_checklist_entries.csv"),
+                  ("Preceptor matches", "redcap_preceptor_matching.csv"),
+                  ("Clinical scores", "redcap_clinical_summary.csv"))
+    for col, (label, filename) in zip(st.columns(3), companions):
+        with col:
+            st.download_button(label, result["redcap_files"][filename], filename, "text/csv",
+                               key="extra_" + filename, width="stretch", on_click="ignore")
+    st.info("Main evaluation import: overwrite blank values OFF. Use the correction files below only when needed.")
+    with st.expander("Correction files & import help", expanded=False):
+        st.warning("These correction files intentionally clear old values. Review them, then import with blank overwriting ON.")
+        for label, filename in (("Update exclusion reasons", "redcap_exclusion_updates.csv"),
+                                 ("Correct clinical scores / N/A", "redcap_clinical_form_updates.csv"),
+                                 ("Correct H&P / handoff values", "redcap_epa_form_updates.csv")):
+            st.download_button(label, result["redcap_files"][filename], filename, "text/csv",
+                               key="extra_" + filename, on_click="ignore")
+        st.caption("The reason Notes Box belongs on a non-repeating student instrument. It includes student, preceptor, form and reason.")
+        st.download_button("Import instructions", REDCAP_HELP.encode(), "REDCAP_SETUP.txt", "text/plain", on_click="ignore")
+    st.download_button("Download all REDCap files", zipped(result["redcap_files"]), "redcap_import_files.zip",
+                       "application/zip", key="dash_redcap_zip", on_click="ignore", width="stretch")
+    for warning in result.get("redcap_warnings", []):
+        st.warning(warning)
+
+
+def dashboard_edit_evaluation(st: Any, state: dict) -> None:
+    ctx = st.session_state["evaluation_edit_context"]
+    rule = ctx["rule"]
+    prefix = "evaluation_edit_" + str(ctx["revision"]) + "_"
+    st.markdown("#### Edit exclusion")
+    st.write(f"{rule['student_name'] or rule['record_id']} · {display_name(rule['evaluator'])} · Form {rule['form_record'] or 'all for this pair'}")
+    overlaps = overlapping_exclusions_after_removal(ctx["rules"], [ctx["rule_id"]])
+    if overlaps:
+        st.warning("Another active rule also covers this evaluation. Disabling this one may not restore it.")
+    can_save = state.get("archive") is not None and not state.get("error")
+    with st.form(prefix + "form", clear_on_submit=False, enter_to_submit=False):
+        reason = st.text_area("Reason", value=rule["reason"], height=130, key=prefix + "reason")
+        active = st.checkbox("Active exclusion", value=rule["active"], key=prefix + "active")
+        values = {}
+        with st.expander("Change student, preceptor or form", expanded=False):
+            st.warning("Change these details only to correct which evaluation is excluded.")
+            fields = (("student_name", "Student name"), ("record_id", "Student ID"), ("evaluator", "Preceptor"),
+                      ("evaluator_email", "Preceptor email"), ("form_record", "Form Record"),
+                      ("rotation_start", "Rotation start (YYYY-MM-DD)"), ("submit_date", "Submitted (YYYY-MM-DD HH:MM:SS)"))
+            columns = st.columns(2)
+            for i, (field_name, label) in enumerate(fields):
+                with columns[i % 2]:
+                    values[field_name] = st.text_input(label, value=rule[field_name], key=prefix + field_name)
+            st.caption("All supplied filters must match. Blank form and submission filters cover the pair, within any rotation filter.")
+            confirm = st.checkbox("I confirm this change to the evaluation or scope.", key=prefix + "confirm_target")
+        left, right = st.columns(2)
+        with left:
+            save = st.form_submit_button("Save changes", type="primary", width="stretch", disabled=not can_save, key="evaluation_edit_save")
+        with right:
+            cancel = st.form_submit_button("Cancel", width="stretch", key="evaluation_edit_cancel")
+    if cancel:
+        cancel_evaluation_edit(st)
+        st.rerun()
+    if save:
+        try:
+            if save_selected_evaluation_edit(st, state, {"reason": reason, "active": active, **values}, confirm_target_change=confirm):
+                st.session_state["dashboard_flash"] = "Saved. Rebuild files to include the updated exclusion."
+                st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+        if st.session_state.get("evaluation_save_error"):
+            dashboard_notice(st, "Not saved. Your edit is still open; retry after checking the connection.", st.session_state["evaluation_save_error"], error=True)
+
+
+def dashboard_begin_add(st: Any) -> None:
+    st.session_state.pop("dashboard_remove_context", None)
+    if dashboard_edit_open(st):
+        raise ValueError("Save or cancel the current edit first.")
+    st.session_state["dashboard_add_revision"] = int(st.session_state.get("dashboard_add_revision", 0)) + 1
+    st.session_state["dashboard_add_context"] = {
+        "rules": normalize_rules(st.session_state["rules"]),
+        "base": coerce_saved_evaluation_rules(st.session_state.get("evaluation_saved_base", SavedEvaluationRules())),
+        "pending": bool(st.session_state.get("evaluation_draft_pending")),
+        "error": st.session_state.get("evaluation_save_error", ""),
+        "revision": st.session_state["dashboard_add_revision"],
+    }
+    st.session_state.pop("result", None)
+
+
+def dashboard_cancel_add(st: Any) -> None:
+    context = st.session_state.pop("dashboard_add_context", None)
+    if context:
+        st.session_state["rules"] = normalize_rules(context["rules"])
+        st.session_state["evaluation_saved_base"] = coerce_saved_evaluation_rules(context["base"])
+        st.session_state["evaluation_draft_pending"] = context["pending"]
+        st.session_state["evaluation_save_error"] = context["error"]
+        st.session_state.pop("result", None)
+
+
+def dashboard_add_targets(oasis_blob: bytes) -> list[dict]:
+    picks = exclusion_choices(read_csv_bytes(oasis_blob, "OASIS ME", Messages()))
+    targets = []
+    for rid, student in sorted(picks.items(), key=lambda pair: pair[1]["name"]):
+        for pk, preceptor in student["preceptors"].items():
+            for fk, form in preceptor["forms"].items():
+                targets.append({"Student": student["name"], "Preceptor": display_name(preceptor["evaluator"]),
+                                "Form": form["form_record"] or "No ID", "Submitted": form["submit_date"],
+                                "record_id": rid, "student_name": student["name"], "evaluator": preceptor["evaluator"],
+                                "evaluator_email": preceptor["email"], "scope": dict(form), "choice_key": digest([rid, pk, fk])})
+    return targets
+
+
+def dashboard_add_evaluation(st: Any, oasis_blob: bytes | None, state: dict) -> None:
+    ctx = st.session_state["dashboard_add_context"]
+    st.markdown("#### Add exclusion")
+    if not oasis_blob:
+        st.info("Upload the OASIS evaluation CSV to choose an evaluation.")
+        if st.button("Cancel", key="dashboard_add_cancel_empty"):
+            dashboard_cancel_add(st); st.rerun()
+        return
+    try:
+        targets = dashboard_add_targets(oasis_blob)
+    except ValueError as exc:
+        st.error(str(exc))
+        if st.button("Cancel", key="dashboard_add_cancel_error"):
+            dashboard_cancel_add(st); st.rerun()
+        return
+    query = st.text_input("Find student, preceptor or form", key="dashboard_add_search").strip().casefold()
+    candidates = [t for t in targets if not query or query in " ".join(str(t[k]) for k in ("Student", "Preceptor", "Form", "Submitted")).casefold()]
+    display = [{k: t[k] for k in ("Student", "Preceptor", "Form", "Submitted", "choice_key")} for t in candidates]
+    selected = dashboard_table(st, display, "dashboard_add_picker_" + str(ctx["revision"]), single=True, hidden=("choice_key",))
+    target = candidates[selected[0]] if selected else None
+    st.caption("Select one row. Use search to narrow the list.")
+    can_save = state.get("archive") is not None and not state.get("error")
+    # A new target gets its own form, avoiding an explanation being saved to the wrong row.
+    prefix = "dash_new_" + str(ctx["revision"]) + "_" + (target["choice_key"] if target else "none")
+    with st.form(prefix, clear_on_submit=False, enter_to_submit=False):
+        reason = st.text_area("Reason", height=115, key=prefix + "_reason")
+        broad = st.checkbox("Apply to all clinical evaluations for this student–preceptor pair", key=prefix + "_all")
+        left, right = st.columns(2)
+        with left:
+            save = st.form_submit_button("Exclude and save", type="primary", width="stretch", key="dash_new_save", disabled=not target or not can_save)
+        with right:
+            cancel = st.form_submit_button("Cancel", width="stretch", key="dash_new_cancel")
+    if cancel:
+        dashboard_cancel_add(st); st.rerun()
+    if save and target:
+        if not reason.strip():
+            st.error("Enter a reason before saving.")
+            return
+        rule = {k: target[k] for k in ("record_id", "student_name", "evaluator", "evaluator_email")}
+        rule.update(reason=reason, active=True, origin="Director", **({} if broad else target["scope"]))
+        normalized = normalize_rules([rule])[0]
+        if any(r["rule_id"] == normalized["rule_id"] for r in ctx["rules"]):
+            st.warning("This exclusion already exists. Cancel, then select it and choose Edit selected.")
+            return
+        st.session_state["evaluation_saved_base"] = coerce_saved_evaluation_rules(ctx["base"])
+        if save_evaluation_rule_action(st, state, merge_rule_updates(ctx["rules"], [rule])):
+            st.session_state.pop("dashboard_add_context", None)
+            st.session_state["dashboard_flash"] = "Exclusion saved. Rebuild files to apply it."
+            st.rerun()
+        else:
+            dashboard_notice(st, "Not saved. Your entry is still open.", st.session_state.get("evaluation_save_error", ""), error=True)
+
+
+def dashboard_evaluations(st: Any, oasis_blob: bytes | None, state: dict) -> None:
+    st.subheader("Evaluation exclusions")
+    st.caption("Affects clinical scores and REDCap reasons—not reminder counts.")
+    dashboard_evaluation_status(st, state)
+    if st.session_state.get("evaluation_edit_context"):
+        dashboard_edit_evaluation(st, state)
+        return
+    if st.session_state.get("dashboard_add_context"):
+        dashboard_add_evaluation(st, oasis_blob, state)
+        return
+    rules = normalize_rules(st.session_state["rules"])
+    can_save = state.get("archive") is not None and not state.get("error")
+    query = st.text_input("Find a saved exclusion", placeholder="Student, preceptor, form or reason", key="dashboard_rule_search").strip().casefold()
+    shown = [r for r in rules if not query or query in evaluation_exclusion_label(r).casefold() or query in r["reason"].casefold()]
+    display = [{"Student": r["student_name"] or r["record_id"], "Preceptor": display_name(r["evaluator"]) or r["evaluator_email"],
+                "Form": r["form_record"] or "All for this pair", "Active": r["active"], "Reason": r["reason"], "rule_id": r["rule_id"]} for r in shown]
+    indices = dashboard_table(st, display, "dashboard_rule_picker", hidden=("rule_id",))
+    selected = [shown[i]["rule_id"] for i in indices]
+    if not shown:
+        st.info("No matching exclusions." if rules else "No evaluation exclusions.")
+    else:
+        st.caption("Select a row to edit. Select one or more rows to remove.")
+    left, mid, right, refresh = st.columns(4)
+    with left:
+        if st.button("＋ Add exclusion", key="dashboard_add_open", width="stretch", disabled=not oasis_blob):
+            dashboard_begin_add(st); st.rerun()
+    with mid:
+        if st.button("Edit selected", key="dashboard_edit_open", width="stretch", disabled=len(selected) != 1):
+            st.session_state.pop("dashboard_remove_context", None)
+            begin_evaluation_edit(st, selected[0]); st.rerun()
+    with right:
+        if st.button("Remove selected", key="dashboard_remove_open", width="stretch", disabled=not selected or not can_save):
+            st.session_state["dashboard_remove_context"] = {"ids": selected, "rules": rules,
+                "base": coerce_saved_evaluation_rules(st.session_state.get("evaluation_saved_base", state["saved"]))}
+            st.rerun()
+    with refresh:
+        if st.button("Refresh list", key="evaluation_refresh", width="stretch"):
+            st.rerun()
+    if not oasis_blob:
+        st.caption("To add a new exclusion, upload the OASIS evaluation file above. Saved exclusions can be edited now.")
+    removal = st.session_state.get("dashboard_remove_context")
+    if removal:
+        ids = removal["ids"]
+        overlaps = overlapping_exclusions_after_removal(removal["rules"], ids)
+        if overlaps:
+            st.warning("Another active rule still covers the same evaluation(s). Removing these alone may not restore them.")
+        st.warning(f"Remove {len(ids)} exclusion(s) and save? Source evaluations are not deleted.")
+        confirm_col, cancel_col = st.columns(2)
+        with confirm_col:
+            if st.button("Confirm removal and save", key="dashboard_remove_confirm", type="primary", disabled=not can_save):
+                st.session_state["evaluation_saved_base"] = coerce_saved_evaluation_rules(removal["base"])
+                desired = remove_evaluation_exclusions(removal["rules"], ids)
+                if save_evaluation_rule_action(st, state, desired):
+                    st.session_state.pop("dashboard_remove_context", None)
+                    st.session_state["dashboard_flash"] = "Exclusions removed and saved. Rebuild files to apply the change."
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel removal", key="dashboard_remove_cancel"):
+                st.session_state.pop("dashboard_remove_context", None); st.rerun()
+    if not evaluation_rules_saved(st, state):
+        if st.button("Save list", type="primary", key="apply_rules", disabled=not can_save):
+            save_evaluation_rule_action(st, state, rules); st.rerun()
+    with st.expander("Backup & recovery", expanded=False):
+        st.download_button("Download exclusions backup", exclusion_backup(st.session_state["rules"]), "exclusions_backup.json", "application/json", on_click="ignore")
+        backup = st.file_uploader("Restore exclusions backup", type=["json"], key="restore_rules")
+        if st.button("Restore for review", key="restore_rules_button", disabled=backup is None):
+            try:
+                st.session_state["rules"] = normalize_rules(json.loads(backup.getvalue().decode("utf-8-sig")))
+                st.session_state["evaluation_draft_pending"] = True
+                st.session_state.pop("result", None)
+                st.session_state.pop("evaluation_save_error", None)
+                st.rerun()
+            except (ValueError, UnicodeError) as exc:
+                st.error("Could not read backup: " + str(exc))
+        if state["saved"].exists and rules != state["saved"].rules:
+            consent = st.checkbox("Discard my unsaved list and use the saved list.", key="evaluation_confirm_discard")
+            if st.button("Discard unsaved list", key="evaluation_discard", disabled=not consent or not state.get("ready")):
+                accept_saved_evaluation_rules(st, state["saved"]); st.rerun()
+
+
+def dashboard_faculty(st: Any, result: dict | None, state: dict) -> None:
+    st.subheader("Faculty reminder exclusions")
+    st.caption("Stops clinical-evaluation and observed H&P reminders for the selected names. Grades do not change.")
+    if not state.get("ready"):
+        dashboard_notice(st, "Saved faculty list unavailable. Open Settings → Storage & REDCap.", state.get("error", "First-time setup may be needed."))
+        st.button("Retry loading list", key="faculty_reminder_retry")
+        return
+    saved = state["saved"]
+    st.success(f"Saved · {len(saved.names)} faculty excluded from reminders")
+    try:
+        choices = faculty_reminder_choices(result["reports"]) if result and not result["run"].messages.blocked else []
+    except ReminderArchiveError as exc:
+        st.error(str(exc)); choices = []
+    excluded = {reminder_name_key(n) for n in saved.names}
+    available = [n for n in choices if reminder_name_key(n) not in excluded]
+    left, right = st.columns(2, gap="large")
+    with left:
+        st.markdown("#### Stop reminders")
+        search = st.text_input("Find faculty", key="dashboard_faculty_search").strip().casefold()
+        names = [n for n in available if not search or search in n.casefold()]
+        selections = dashboard_table(st, [{"Faculty": n} for n in names], "dashboard_faculty_add")
+        additions = [names[i] for i in selections]
+        if not names:
+            st.info("No matching faculty." if choices else "Generate reminders to load faculty names.")
+        if st.button("Exclude selected and save", key="faculty_reminder_save_add", disabled=not additions, type="primary", width="stretch"):
+            try:
+                state["archive"].change(add=additions)
+                st.session_state["dashboard_flash"] = "Saved. Download fresh reminder files to use the updated list."
+                st.rerun()
+            except ReminderArchiveError as exc:
+                state["ready"], state["error"] = False, str(exc)
+                dashboard_notice(st, "Not saved. Please retry.", str(exc), error=True)
+    with right:
+        st.markdown("#### Resume reminders")
+        search = st.text_input("Find excluded faculty", key="dashboard_faculty_restore_search").strip().casefold()
+        names = [n for n in saved.names if not search or search in n.casefold()]
+        selections = dashboard_table(st, [{"Excluded faculty": n} for n in names], "dashboard_faculty_remove")
+        removals = [names[i] for i in selections]
+        if not names:
+            st.info("No excluded faculty match." if saved.names else "No faculty excluded.")
+        if st.button("Restore selected and save", key="faculty_reminder_save_remove", disabled=not removals, width="stretch"):
+            try:
+                state["archive"].change(remove=removals)
+                st.session_state["dashboard_flash"] = "Saved. Faculty can receive reminders again when an assessment is outstanding."
+                st.rerun()
+            except ReminderArchiveError as exc:
+                state["ready"], state["error"] = False, str(exc)
+                dashboard_notice(st, "Not saved. Please retry.", str(exc), error=True)
+    st.caption("Applies to both preceptor files, all students and rotations. Identical displayed names share the rule. Previously downloaded files do not change.")
+
+
+def dashboard_subnav(st: Any, options: tuple[str, ...], state_key: str) -> str:
+    current = st.session_state.get(state_key, options[0])
+    for col, label in zip(st.columns(len(options)), options):
+        with col:
+            if st.button(label, key=state_key + "_" + label, type="primary" if current == label else "secondary", width="stretch"):
+                st.session_state[state_key] = label
+                st.rerun()
+    return current
+
+
+def dashboard_review(st: Any, result: dict | None, reminder_state: dict, grading_ready: bool) -> None:
+    st.subheader("Review")
+    if not result:
+        st.info("Generate reminders or a REDCap export to review this run."); return
+    choice = dashboard_subnav(st, ("Student progress", "Clinical scores", "File checks"), "dashboard_review_page")
+    if choice == "File checks":
+        dashboard_checks(st, result, detailed=True); return
+    if not dashboard_checks(st, result):
+        return
+    if choice == "Student progress":
+        st.dataframe(result["run"].reports["student_review"], hide_index=True, width="stretch", height=360)
+        st.download_button("Download student progress", result["reports"]["all_student_requirement_status.csv"],
+                           "all_student_requirement_status.csv", "text/csv", on_click="ignore")
+        return
+    if not grading_ready:
+        st.warning("Save evaluation exclusions before viewing scores."); return
+    st.caption("Clinical component only · 375 possible points · not the final clerkship grade")
+    scores = result["run"].reports["scores"]
+    concise = [{"Student": s["student_name"], "Received": s["cas_submissions"], "Manually excluded": s["manual_exclusions"],
+                "Score / 375": s["clinical_score_375"], "Automatic drop": s["dropped_evaluator"]} for s in scores]
+    st.dataframe(concise, hide_index=True, width="stretch", height=320)
+    reports, readiness, removed = dashboard_filtered_reports(result, reminder_state)
+    details = dict(reports)
+    for name in REMINDER_NAMES:
+        if not readiness[name]:
+            details.pop(name, None)
+    details["exclusions_backup.json"] = exclusion_backup(result["run"].settings.exclusions)
+    if result.get("redcap"):
+        details.update(result["redcap_files"])
+    a, b = st.columns(2)
+    with a:
+        st.download_button("Download clinical scores", reports["clinical_scores.csv"], "clinical_scores.csv", "text/csv", on_click="ignore")
+    with b:
+        st.download_button("Download director package", zipped(details), "director_outputs.zip", "application/zip", on_click="ignore")
+    st.caption("Director package contains grades and narratives—not a Power Automate input.")
+
+
+def dashboard_settings(st: Any, evaluation_state: dict, reminder_state: dict, numbering_state: dict) -> None:
+    st.subheader("Settings")
+    choice = dashboard_subnav(st, ("Dates & requirements", "Storage & REDCap", "Sign out"), "dashboard_settings_page")
+    if choice == "Storage & REDCap":
+        st.caption("One-time setup and recovery. Existing connections do not need to be changed.")
+        # Existing setup tools retain their full safeguards, but are off the daily screen.
+        render_numbering_setup(st, numbering_state)
+        if reminder_state.get("ready"):
+            st.success("Faculty reminder storage connected.")
+        else:
+            render_faculty_reminder_controls(st, None, reminder_state)
+        dashboard_evaluation_status(st, evaluation_state)
+        st.download_button("Original REDCap field reference", csv_bytes([], LEGACY_EVAL_COLUMNS),
+                           "redcap_oasis_eval_clerk_upload_TEMPLATE.csv", "text/csv", on_click="ignore", key="dash_field_ref")
+        st.download_button("REDCap import guide", REDCAP_HELP.encode(), "REDCAP_SETUP.txt", "text/plain", on_click="ignore", key="dash_redcap_help")
+        return
+    if choice == "Sign out":
+        base = coerce_saved_evaluation_rules(st.session_state.get("evaluation_saved_base", SavedEvaluationRules()))
+        unsaved = (dashboard_edit_open(st) or normalize_rules(st.session_state.get("rules", [])) != base.rules
+                   or bool(st.session_state.get("evaluation_save_error")))
+        allowed = not unsaved
+        if unsaved:
+            st.warning("You have unsaved evaluation exclusions. Save or download a backup before signing out.")
+            st.download_button("Download exclusions backup", exclusion_backup(st.session_state.get("rules", [])), "exclusions_backup.json", "application/json", on_click="ignore")
+            allowed = st.checkbox("Discard these unsaved changes when I sign out.", key="allow_unsaved_signout")
+        if st.button("Clear files and sign out", key="signout", disabled=not allowed, type="primary"):
+            st.session_state.clear(); st.rerun()
+        return
+    current = st.session_state["options"]
+    with st.form("options_form", enter_to_submit=False):
+        left, right = st.columns(2)
+        with left:
+            as_of = st.date_input("Reminder date", value=dt(current.get("as_of") or datetime.now(ZoneInfo("America/New_York")).date()).date())
+        with right:
+            through = st.text_input("OASIS data through (optional YYYY-MM-DD)", value=current.get("data_through", ""))
+        targets = {}
+        for col, k, default in zip(st.columns(3), KINDS, (8, 2, 1)):
+            with col:
+                targets[k + "_target"] = int(st.number_input(LABELS[k], min_value=1, max_value=100, value=int(current.get(k + "_target", default))))
+        with st.expander("Advanced dates & reminder links", expanded=False):
+            duration = st.number_input("Rotation length (calendar days)", min_value=1, max_value=365, value=int(current.get("rotation_days", 26)))
+            grace = st.number_input("Preceptor grace days", min_value=0, max_value=365, value=int(current.get("grace_days", 0)))
+            confirm = st.checkbox("The exports cover this rotation even when a whole source has zero rows.", value=bool(current.get("confirm_coverage", False)))
+            urls = {k + "_url": st.text_input(LABELS[k] + " link", value=current.get(k + "_url", SURVEYS[k])) for k in KINDS}
+            partial = st.checkbox("Keep original partially prefilled links", value=bool(current.get("legacy_partial_links", True)))
+        if st.form_submit_button("Apply settings", type="primary"):
+            if through and (day(through) != through or through > as_of.isoformat()):
+                st.error("Use YYYY-MM-DD, no later than the reminder date.")
+            elif any(u and not u.startswith("https://") for u in urls.values()):
+                st.error("Links must start with https:// or be blank.")
+            else:
+                st.session_state["options"] = dict(as_of=as_of.isoformat(), data_through=through, rotation_days=int(duration),
+                    grace_days=int(grace), confirm_coverage=confirm, legacy_partial_links=partial, **targets, **urls)
+                st.session_state.pop("result", None)
+                st.session_state["dashboard_flash"] = "Settings applied for this session. Rebuild your files."
+                st.rerun()
+
+
+def main() -> None:
+    import streamlit as st
+    st.set_page_config(page_title="Pediatric Clerkship Tracker", page_icon="📋", layout="wide")
+    st.markdown(DASHBOARD_CSS, unsafe_allow_html=True)
+    st.markdown('<div class="clerkship-head"><div class="clerkship-mark">P</div><div><h1>Pediatric Clerkship</h1>'
+                '<p>Upload. Review. Download.</p></div></div>', unsafe_allow_html=True)
+    if not authenticate(st):
+        st.stop()
+    evaluation_state = evaluation_archive_state(st)
+    try:
+        sync_evaluation_rules(st, evaluation_state)
+    except (ValueError, TypeError) as exc:
+        dashboard_notice(st, "Your saved evaluation settings need attention.", str(exc), error=True)
+        st.stop()
+    st.session_state.setdefault("options", {})
+    st.session_state.setdefault("dashboard_page", "reminders")
+    uploads = dashboard_inputs(st)
+    ready, blobs, names, settings, signature = dashboard_source_context(st, uploads)
+    numbering_state = numbering_archive_state(st)
+    reminder_state = reminder_archive_state(st)
+    grading_ready = dashboard_grading_ready(st, evaluation_state)
+    editing = dashboard_edit_open(st)
+    page = st.session_state["dashboard_page"]
+    if editing:
+        page = st.session_state["dashboard_page"] = "evaluations"
+    requested = None
+    buttons = (("Generate reminders", "reminders", "create_files"), ("REDCap export", "redcap", "dashboard_generate_redcap"),
+               ("Exclude evaluations", "evaluations", "dashboard_nav_evaluations"),
+               ("Exclude faculty", "faculty", "dashboard_nav_faculty"), ("Review", "review", "dashboard_nav_review"),
+               ("Settings", "settings", "dashboard_nav_settings"))
+    with st.container(key="dashboard_actions"):
+        for col, (label, route, widget) in zip(st.columns([1.25, 1.15, 1.35, 1.15, .8, .8], gap="small"), buttons):
+            with col:
+                disabled = editing or (route in {"reminders", "redcap"} and not ready)
+                if st.button(label, key=widget, type="primary" if page == route else "secondary", disabled=disabled, width="stretch"):
+                    page = route
+                    st.session_state["dashboard_page"] = route
+                    if route != "evaluations":
+                        st.session_state.pop("dashboard_remove_context", None)
+                    requested = route
+    flash = st.session_state.pop("dashboard_flash", "")
+    if flash:
+        st.success(flash)
+    # Old UI success notices are replaced with a short equivalent; no save logic changes.
+    if st.session_state.pop("evaluation_rules_feedback", "") and not flash:
+        st.success("Exclusions saved. Rebuild your files to apply the changes.")
+    st.session_state.pop("evaluation_edit_notice", None)
+    st.session_state.pop("faculty_reminder_flash", None)
+    existing = st.session_state.get("result")
+    current = existing if existing and ready and existing.get("signature") == signature else None
+    if requested in {"reminders", "redcap"}:
+        current = dashboard_build(st, blobs, names, settings, signature, evaluation_state, numbering_state, prepare_redcap=requested == "redcap")
+    elif requested == "faculty" and not current and ready:
+        # Only a local calculation to populate the names; never reserves REDCap numbers.
+        current = dashboard_build(st, blobs, names, settings, signature, evaluation_state, numbering_state, prepare_redcap=False)
+    elif existing and not current:
+        st.info("Files or settings changed. Generate fresh files before downloading.")
+    if page == "reminders":
+        dashboard_reminders(st, current, reminder_state, ready)
+    elif page == "redcap":
+        dashboard_redcap(st, current, grading_ready, numbering_state, ready)
+    elif page == "evaluations":
+        dashboard_evaluations(st, uploads[3].getvalue() if uploads[3] else None, evaluation_state)
+    elif page == "faculty":
+        dashboard_faculty(st, current, reminder_state)
+    elif page == "review":
+        dashboard_review(st, current, reminder_state, grading_ready)
+    else:
+        dashboard_settings(st, evaluation_state, reminder_state, numbering_state)
+    st.caption("Downloads only · No emails sent · No automatic REDCap upload")
 
 
 if __name__ == "__main__":
