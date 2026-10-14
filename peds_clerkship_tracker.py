@@ -3339,7 +3339,8 @@ DASHBOARD_SOURCES = (
 )
 DASHBOARD_CSS = """
 <style>
-.block-container {max-width: 1580px; padding-top: 1.4rem; padding-bottom: 1.5rem;}
+/* Leave room for Streamlit's fixed toolbar on the sign-in and dashboard screens. */
+.block-container {max-width: 1580px; padding-top: calc(4.75rem + env(safe-area-inset-top, 0px)); padding-bottom: 1.5rem;}
 .clerkship-head {display:flex; align-items:center; gap:14px; margin-bottom:12px;}
 .clerkship-mark {background:#183954; color:white; border-radius:14px; padding:12px 15px;
   font-size:22px; font-weight:750; line-height:1;}
