@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 from zoneinfo import ZoneInfo
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 SCHEMA_VERSION = "clerkship_flat_v1"
 
 
@@ -1587,6 +1587,18 @@ class NumberingError(ValueError):
     """Do not guess an existing repeat number when identity is ambiguous."""
 
 
+class MissingClinicalAssessmentsError(NumberingError):
+    """A reviewable missing-source check, separate from identity/numbering errors."""
+    def __init__(self, missing_assessments: list[dict], review_token: str, detail: str = ""):
+        self.missing_assessments = missing_assessments
+        self.review_token = review_token
+        students = sorted({r["record_id"] for r in missing_assessments})
+        message = ("The OASIS upload is missing previously numbered clinical assessments for: "
+                   + ", ".join(students) + ". Use the complete source export, or review a confirmed "
+                   "OASIS correction below and override this check for this export. No files were generated.")
+        super().__init__((detail + " " if detail else "") + message)
+
+
 def empty_number_registry() -> dict:
     return {"version": 1, "purpose": NUMBERING_PURPOSE, "entries": []}
 
@@ -1787,7 +1799,53 @@ def evaluation_exclusion_reasons(run: Run) -> dict[str, str]:
     return {rid: "\n\n".join(items) for rid, items in blocks.items()}
 
 
-def plan_legacy_exports(run: Run, registry: dict) -> dict:
+def review_missing_clinical_assessments(run: Run, missing: list[dict], override: dict | None) -> list[dict]:
+    """Approve only the reviewed students/slots for this exact processed source run.
+
+    This is an export exception, never an evaluation exclusion or a saved waiver.
+    No missing assessment is reconstructed, marked received, or removed from REDCap.
+    """
+    if not missing:
+        return []
+    token = digest([VERSION, asdict(run.settings), run.roster, run.evaluations,
+                    run.entries, run.matches, run.reports["scores"], run.coverage,
+                    run.source_stats, missing])
+    if override is None:
+        raise MissingClinicalAssessmentsError(missing, token)
+    if not isinstance(override, dict) or override.get("review_token") != token:
+        raise MissingClinicalAssessmentsError(missing, token,
+            "The source data or missing records changed. Review the current list again.")
+    record_ids = override.get("record_ids")
+    if (not isinstance(record_ids, list) or not record_ids
+            or any(not isinstance(rid, str) for rid in record_ids)):
+        raise MissingClinicalAssessmentsError(missing, token, "Select the students to override.")
+    affected = {r["record_id"] for r in missing}
+    selected = set(record_ids)
+    if selected - affected:
+        raise MissingClinicalAssessmentsError(missing, token,
+            "The selected students no longer match this review. Select them again.")
+    reason = text(override.get("reason"))
+    if not reason or len(reason) > 1000:
+        raise MissingClinicalAssessmentsError(missing, token,
+            "Enter a reason for the override, up to 1,000 characters.")
+    if affected - selected:
+        raise MissingClinicalAssessmentsError(missing, token,
+            "No files were generated. These students still need review: "
+            + ", ".join(sorted(affected - selected)) + ".")
+    reviewed_at = datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds")
+    counts = Counter(e["record_id"] for e in run.evaluations if e["kind"] == "cas")
+    return [{"record_id": r["record_id"], "student_name": r["student_name"],
+             "rotation_start": r["rotation_start"],
+             "redcap_repeat_instrument": r["redcap_repeat_instrument"],
+             "redcap_repeat_instance": r["redcap_repeat_instance"],
+             "current_cas_submissions": counts[r["record_id"]],
+             "override_reason": reason, "reviewed_at": reviewed_at,
+             "review_token": token,
+             "action": "Export current OASIS data. Keep missing record number reserved. No REDCap deletion."}
+            for r in missing]
+
+
+def plan_legacy_exports(run: Run, registry: dict, *, missing_cas_override: dict | None = None) -> dict:
     """Pure plan. Callers must persist the returned registry before handing out numbered imports."""
     if run.messages.blocked or not run.roster or not all(daily_readiness(run).values()):
         raise NumberingError("Resolve file/rotation coverage checks before creating the REDCap import.")
@@ -1855,10 +1913,21 @@ def plan_legacy_exports(run: Run, registry: dict) -> dict:
         rendered.append(row)
     # A selected student's previously numbered clinical assessments must be represented
     # before updating the parent's dropped-evaluation value or final clinical summary.
-    selected = {r["record_id"] for r in run.roster}
-    absent_cas = {e["rid"] for e in entries if e["rid"] in selected and e["form"] == "oasis_eval" and (e["rid"], e["form"], e["n"]) not in handled}
-    if absent_cas:
-        raise NumberingError("The OASIS upload is missing previously numbered clinical assessments for: " + ", ".join(sorted(absent_cas)) + ". Use the complete source export; no incomplete score/exclusion update was generated.")
+    roster = {r["record_id"]: r for r in run.roster}
+    selected = set(roster)
+    missing = [{"record_id": e["rid"], "student_name": roster[e["rid"]]["student_name"],
+                "rotation_start": roster[e["rid"]]["start_date"],
+                "redcap_repeat_instrument": e["form"], "redcap_repeat_instance": e["n"],
+                "registry_fingerprint": digest(e)}
+               for e in entries if e["rid"] in selected and e["form"] == "oasis_eval"
+               and (e["rid"], e["form"], e["n"]) not in handled]
+    missing.sort(key=lambda r: (r["record_id"], r["redcap_repeat_instance"]))
+    overrides = review_missing_clinical_assessments(run, missing, missing_cas_override)
+    for rid in sorted({r["record_id"] for r in overrides}):
+        numbers = ", ".join(str(r["redcap_repeat_instance"]) for r in overrides if r["record_id"] == rid)
+        warnings.append(f"Override applied for {rid}: missing clinical assessment repeat number(s) {numbers}. "
+                        "Scores and exclusion updates use only the current OASIS data. These numbers remain reserved. "
+                        "Any previously imported REDCap assessments remain in REDCap and need separate review.")
     for form in ("epa", "checklist_entry", "preceptor_matching"):
         absent = sum(e["rid"] in selected and e["form"] == form and (e["rid"], e["form"], e["n"]) not in handled for e in entries)
         if absent:
@@ -1894,9 +1963,12 @@ def plan_legacy_exports(run: Run, registry: dict) -> dict:
     # Authoritative form-specific updates avoid broad blank clearing across forms.
     files["redcap_clinical_form_updates.csv"] = csv_bytes([r for r in rendered if r["redcap_repeat_instrument"] == "oasis_eval"], REPEAT_COLUMNS + CAS_EXPORT_COLUMNS)
     files["redcap_epa_form_updates.csv"] = csv_bytes([r for r in rendered if r["redcap_repeat_instrument"] == "epa"], REPEAT_COLUMNS + EPA_EXPORT_COLUMNS)
+    if overrides:
+        files["redcap_missing_assessment_override_audit.csv"] = csv_bytes(overrides)
     reg["entries"].sort(key=lambda e: (e["rid"], e["form"], e["n"]))
     validate_number_registry(reg)
-    return {"registry": reg, "files": files, "evaluation_rows": len(evaluation_rows), "manual_omitted": omitted_manual, "warnings": list(dict.fromkeys(warnings))}
+    return {"registry": reg, "files": files, "evaluation_rows": len(evaluation_rows), "manual_omitted": omitted_manual,
+            "warnings": list(dict.fromkeys(warnings)), "missing_cas_overrides": overrides}
 
 
 REDCAP_HELP = """ORIGINAL REDCAP EVALUATION LAYOUT
@@ -1980,6 +2052,24 @@ Full current source exports are needed for scores.
 The download includes the selected rotation(s), not all historic student records.
 The number registry preserves older numbers, not older grades or narratives.
 Importing CSVs does not delete source items missing from a later run.
+
+CONFIRMED OASIS CORRECTIONS / MISSING ASSESSMENT OVERRIDE
+If a previously numbered clinical assessment is absent, the normal export stops.
+After confirming a correction in OASIS, open REDCap export, review the affected
+students and missing repeat numbers, select the students, enter the reason, and
+choose Override and prepare REDCap files. Every affected student must be reviewed
+before the combined export can be prepared. Other validation checks still apply.
+The override applies only to this export and this exact reviewed missing-record
+list. A new export requires another review if the assessments are still absent.
+Scores and the automatic lowest-score exclusion use only the current upload.
+The override does not restore missing scores, count missing assessments as
+received, or change reminder matching. Old repeat numbers stay reserved. A new
+source form gets a new number when it cannot match an existing saved identity.
+Review any old assessment already in REDCap separately. It is not deleted by
+this export and may still affect REDCap calculations until reconciled there.
+redcap_missing_assessment_override_audit.csv records the reviewed missing numbers,
+reason, date/time and source review reference. Keep it for your records only.
+Do not import this audit CSV into REDCap. The normal 31-column import is unchanged.
 """
 
 
@@ -2008,7 +2098,7 @@ def build_bundle(source_bytes: list[bytes], filenames: list[str], settings: Sett
         try:
             attach_legacy_plan(result, plan_legacy_exports(run, registry))
         except ValueError as exc:
-            result["redcap_error"] = str(exc)
+            record_redcap_error(result, exc)
     else:
         result["redcap_error"] = "Complete the one-time REDCap numbering setup; the four reminder outputs are unaffected."
     return result
@@ -3087,13 +3177,13 @@ class GitHubNumberingArchive(GitHubReminderArchive):
             raise NumberingError("The initialized numbering could not be verified; refresh before exporting.")
         return saved
 
-    def prepare(self, run: Run) -> dict:
+    def prepare(self, run: Run, *, missing_cas_override: dict | None = None) -> dict:
         """Called only by Create files after explicit first-time storage consent."""
         for _ in range(3):
             previous = self.load_numbers()
             if not previous.exists:
                 raise NumberingError("Complete the one-time REDCap numbering setup below; no number was guessed.")
-            plan = plan_legacy_exports(run, previous.registry)
+            plan = plan_legacy_exports(run, previous.registry, missing_cas_override=missing_cas_override)
             if plan["registry"] == previous.registry:
                 return plan
             response = self._write_numbers(plan["registry"], previous)
@@ -3108,6 +3198,13 @@ class GitHubNumberingArchive(GitHubReminderArchive):
             now = {(e["rid"], e["form"], a): e["n"] for e in saved.registry["entries"] for a in e["aliases"]}
             if any(now.get((e["rid"], e["form"], a)) != e["n"] for e in plan["registry"]["entries"] for a in e["aliases"]):
                 raise NumberingError("The saved numbers changed before verification; rebuild the download.")
+            if missing_cas_override is not None:
+                # A concurrent writer may have reserved another now-missing assessment
+                # after our save. The earlier review must not silently cover that slot.
+                verified = plan_legacy_exports(run, saved.registry, missing_cas_override=missing_cas_override)
+                if verified["registry"] != saved.registry:
+                    raise NumberingError("The saved numbers changed before verification. Review the export again.")
+                return verified
             return plan
         raise NumberingError("Concurrent changes or branch protection prevented saving the REDCap numbers; refresh and retry.")
 
@@ -3164,10 +3261,21 @@ def render_numbering_setup(st: Any, state: dict) -> None:
         st.caption("The primary CSV has your original 30 columns plus reason. Checklist entries, preceptor matches and clinical summary scores are separate companion files. Existing REDCap calculations are not replaced.")
 
 
+def record_redcap_error(result: dict, exc: Exception) -> None:
+    """Retain review details only for the specific missing-assessment guard."""
+    result.update(redcap=b"", redcap_count=0, redcap_files={}, redcap_warnings=[],
+                  redcap_error=str(exc), missing_cas_review={}, missing_cas_overrides=[])
+    result.pop("registry", None)
+    if isinstance(exc, MissingClinicalAssessmentsError):
+        result["missing_cas_review"] = {"missing_assessments": exc.missing_assessments,
+                                        "review_token": exc.review_token}
+
+
 def attach_legacy_plan(result: dict, plan: dict) -> None:
     result.update(redcap=plan["files"][LEGACY_EVAL_FILENAME], redcap_count=plan["evaluation_rows"],
                   redcap_files=plan["files"], redcap_warnings=plan["warnings"], redcap_error="",
-                  registry=plan["registry"], manual_omitted=plan["manual_omitted"])
+                  registry=plan["registry"], manual_omitted=plan["manual_omitted"],
+                  missing_cas_review={}, missing_cas_overrides=plan.get("missing_cas_overrides", []))
 
 
 def render_downloads(st: Any, result: dict, reminder_state: dict | None = None, *, evaluation_ready: bool = True) -> None:
@@ -3295,7 +3403,7 @@ def legacy_main() -> None:
                     try:
                         attach_legacy_plan(result, numbering_state["archive"].prepare(result["run"]))
                     except (ReminderArchiveError, NumberingError) as exc:
-                        result["redcap_error"] = str(exc)
+                        record_redcap_error(result, exc)
             if not grading_ready:
                 result["redcap_error"] = "Save and verify evaluation exclusions under Show director tools before preparing scores or REDCap downloads."
             st.session_state["result"] = {**result, "signature": signature}
@@ -3452,7 +3560,7 @@ def dashboard_build(st: Any, blobs: list[bytes], names: list[str], settings: Set
                     try:
                         attach_legacy_plan(result, numbering_state["archive"].prepare(result["run"]))
                     except (ReminderArchiveError, NumberingError) as exc:
-                        result["redcap_error"] = str(exc)
+                        record_redcap_error(result, exc)
             result["signature"] = signature
             st.session_state["result"] = result
             return result
@@ -3539,6 +3647,56 @@ def dashboard_reminders(st: Any, result: dict | None, reminder_state: dict, read
     st.caption("Your four original filenames and columns. The checklist file includes Complete and Needs review rows.")
 
 
+def dashboard_missing_cas_override(st: Any, result: dict, numbering_state: dict) -> None:
+    """Offer an export-only exception after the missing-assessment check fails."""
+    review = result.get("missing_cas_review", {})
+    missing = review.get("missing_assessments", [])
+    if not missing or not review.get("review_token"):
+        return
+    st.subheader("Override a confirmed OASIS correction")
+    st.write("Use this when you have confirmed that an assessment was corrected or removed in OASIS "
+             "and the current upload contains the assessments you want to use.")
+    counts = Counter(e["record_id"] for e in result["run"].evaluations if e["kind"] == "cas")
+    students = {}
+    rows = []
+    for rid in sorted({r["record_id"] for r in missing}):
+        records = [r for r in missing if r["record_id"] == rid]
+        students[rid] = f"{records[0]['student_name']} ({rid})"
+        rows.append({"Student": records[0]["student_name"], "Student ID": rid,
+                     "Missing REDCap assessment numbers": ", ".join(str(r["redcap_repeat_instance"]) for r in records),
+                     "Clinical assessments in current OASIS upload": counts[rid]})
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.warning("The export will calculate scores and the lowest-score exclusion from the current OASIS upload. "
+               "Missing assessments will not be counted or restored. Any assessment already imported into REDCap "
+               "will remain there and needs separate review.")
+    # Fresh form keys prevent a selection or reason from authorizing changed uploads.
+    scope = digest([result.get("signature", ""), review["review_token"]])[:20]
+    with st.form("missing_cas_override_" + scope):
+        selected = st.multiselect("Students to override", options=list(students),
+                                  format_func=lambda rid: students[rid],
+                                  key="missing_cas_students_" + scope)
+        reason = st.text_area("Reason for this override", max_chars=1000,
+                              placeholder="For example: Incorrect preceptor match corrected in OASIS. Current export reviewed.",
+                              key="missing_cas_reason_" + scope)
+        st.caption("This override applies to these prepared files only. Select every affected student "
+                   "whose correction you have confirmed to prepare the combined export.")
+        submitted = st.form_submit_button("Override and prepare REDCap files", type="primary")
+    if not submitted:
+        return
+    if not selected or not text(reason):
+        st.error("Select the student and enter a reason for the override.")
+        return
+    override = {"review_token": review["review_token"], "record_ids": selected, "reason": text(reason)}
+    try:
+        with st.spinner("Preparing REDCap files with the reviewed override..."):
+            plan = numbering_state["archive"].prepare(result["run"], missing_cas_override=override)
+            attach_legacy_plan(result, plan)
+    except (ReminderArchiveError, NumberingError) as exc:
+        record_redcap_error(result, exc)
+    st.session_state["result"] = result
+    st.rerun()
+
+
 def dashboard_redcap(st: Any, result: dict | None, grading_ready: bool, numbering_state: dict, ready: bool) -> None:
     st.subheader("REDCap import files")
     if not grading_ready:
@@ -3553,8 +3711,22 @@ def dashboard_redcap(st: Any, result: dict | None, grading_ready: bool, numberin
     if not dashboard_checks(st, result):
         return
     if not result.get("redcap"):
-        dashboard_notice(st, "REDCap files are not ready. Choose REDCap export to rebuild.", result.get("redcap_error", ""))
+        message = ("REDCap export paused. Review the missing assessments below."
+                   if result.get("missing_cas_review") else "REDCap files are not ready. Choose REDCap export to rebuild.")
+        dashboard_notice(st, message, result.get("redcap_error", ""))
+        dashboard_missing_cas_override(st, result, numbering_state)
         return
+    if result.get("missing_cas_overrides"):
+        students = ", ".join(sorted({r["record_id"] for r in result["missing_cas_overrides"]}))
+        st.success("REDCap files prepared with a reviewed override for: " + students + ".")
+        st.warning("These files use the current OASIS assessments. Previously imported missing assessments "
+                   "remain in REDCap and may still affect its calculations until you reconcile them there.")
+        st.download_button("Download override audit (for your records)",
+                           result["redcap_files"]["redcap_missing_assessment_override_audit.csv"],
+                           "redcap_missing_assessment_override_audit.csv", "text/csv",
+                           key="download_missing_cas_override_audit", on_click="ignore")
+        st.caption("Do not import the override audit into REDCap. It is also included in the ZIP download. "
+                   "A new export requires another review if assessments are still missing.")
     st.caption("Download these CSVs, then import them in REDCap. This app does not upload them automatically.")
     rows = result["redcap_count"]
     st.download_button(f"Download evaluations + reasons · {rows} rows", result["redcap"], LEGACY_EVAL_FILENAME, "text/csv",
